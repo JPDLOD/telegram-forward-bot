@@ -19,11 +19,12 @@ from database import (
 )
 
 # =========================
-# CONFIG (usa ENV si existen; si no, usa estos valores)
+# CONFIG (TOKEN SOLO POR ENV)
 # =========================
-BOT_TOKEN      = os.getenv("BOT_TOKEN", "8400444635:AAEM4pm4vWtiFIWq9ECe7VWeI9lm6UsLgM4")
-SOURCE_CHAT_ID = int(os.getenv("SOURCE_CHAT_ID", "-1002859784457"))   # BORRADOR
-TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "-1002679848195"))  # PRINCIPAL
+# IMPORTANTE: No hay valor por defecto. Si falta, revienta con error claro.
+BOT_TOKEN = os.environ["BOT_TOKEN"]  # <- Solo Render Environment
+SOURCE_CHAT_ID = -1002859784457      # BORRADOR (fijo, como pediste)
+TARGET_CHAT_ID = -1002679848195      # PRINCIPAL (fijo, como pediste)
 DB_FILE = "drafts.db"
 
 # ========= LOGGING =========
@@ -75,7 +76,7 @@ def _poll_payload_from_raw(raw: dict) -> Tuple[dict, bool]:
         except Exception:
             pass
 
-    # Explicación (para quiz) — Telegram soporta explanation solo para quiz en sendPoll
+    # Explicación (solo quiz)
     if is_quiz and p.get("explanation"):
         kwargs["explanation"] = str(p["explanation"])
 
@@ -117,7 +118,6 @@ async def _publicar_todo(context: ContextTypes.DEFAULT_TYPE) -> Tuple[int, int]:
             enviados_ids.append(mid)
 
         except (Forbidden, BadRequest) as e:
-            # permisos / formato
             fallidos += 1
             logger.error(f"Falló publicar {mid}: {e}")
         except TelegramError as e:
@@ -135,7 +135,7 @@ async def _publicar_todo(context: ContextTypes.DEFAULT_TYPE) -> Tuple[int, int]:
 # Handler único de POSTS en el CANAL BORRADOR
 # -------------------------------------------------------
 async def handle_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.channel_post  # IMPORTANTÍSIMO: en canales es channel_post
+    msg = update.channel_post  # En canales es channel_post
     if not msg:
         return
     if msg.chat_id != SOURCE_CHAT_ID:
@@ -169,10 +169,10 @@ async def handle_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if txt.startswith("/enviar") or txt.startswith("/enviar_casos_clinicos"):
         ok, fail = await _publicar_todo(context)
-        msg = f"✅ Publicados {ok} mensaje(s)."
+        msg_out = f"✅ Publicados {ok} mensaje(s)."
         if fail:
-            msg += f" ⚠️ Fallidos: {fail} (revisa permisos del canal destino, especialmente ENCUESTAS)."
-        await context.bot.send_message(SOURCE_CHAT_ID, msg)
+            msg_out += f" ⚠️ Fallidos: {fail} (verifica permisos en el canal destino, especialmente ENCUESTAS)."
+        await context.bot.send_message(SOURCE_CHAT_ID, msg_out)
         return
 
     if txt.startswith("/programar"):
@@ -187,10 +187,10 @@ async def handle_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             async def job(ctx: ContextTypes.DEFAULT_TYPE):
                 ok, fail = await _publicar_todo(ctx)
-                msg = f"⏱️ Programación ejecutada. Publicados {ok}."
+                msg2 = f"⏱️ Programación ejecutada. Publicados {ok}."
                 if fail:
-                    msg += f" Fallidos: {fail}."
-                await ctx.bot.send_message(SOURCE_CHAT_ID, msg)
+                    msg2 += f" Fallidos: {fail}."
+                await ctx.bot.send_message(SOURCE_CHAT_ID, msg2)
 
             context.job_queue.run_once(lambda ctx: job(ctx), when=seconds)
             await context.bot.send_message(SOURCE_CHAT_ID, f"🗓️ Programado para {when:%Y-%m-%d %H:%M}.")
@@ -224,12 +224,19 @@ async def handle_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_draft(DB_FILE, msg.message_id, snippet, raw_json)
     logger.info(f"Guardado en borrador: {msg.message_id}")
 
+# ========= ERROR HANDLER (para ver tracebacks bonitos) =========
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Excepción no capturada", exc_info=context.error)
+
 # ========= MAIN =========
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     # En canales se usa MessageHandler con ChatType.CHANNEL
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel))
+
+    # Registrar error handler
+    app.add_error_handler(on_error)
 
     logger.info("Bot iniciado 🚀 Escuchando channel_post en el BORRADOR.")
     app.run_polling(allowed_updates=["channel_post"], drop_pending_updates=True)
