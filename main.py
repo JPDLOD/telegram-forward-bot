@@ -1,15 +1,18 @@
 # -*- coding: utf-8 -*-
-# Canal BORRADOR -> Canal PRINCIPAL
-# Guarda todo lo que publiques en el BORRADOR en SQLite y, al usar /enviar o /programar,
-# lo publica en el PRINCIPAL copiando (sin "Forwarded from...") y respetando el orden.
+# BORRADOR (-1002859784457) -> PRINCIPAL (-1002679848195)
+# Guarda todo lo que publiques en BORRADOR y, al usar /enviar o /programar,
+# lo publica en PRINCIPAL en el MISMO ORDEN, sin "Forwarded from...".
+# Reconstruye encuestas (quiz/regular) y copia el resto de mensajes.
 
 import os
 import json
 import logging
 from datetime import datetime
+from typing import Tuple
 
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
+from telegram.error import TelegramError, Forbidden, BadRequest
 
 from database import (
     init_db, save_draft, get_unsent_drafts, mark_sent, delete_draft, list_drafts
@@ -32,14 +35,63 @@ init_db(DB_FILE)
 logger.info(f"SQLite listo. BORRADOR={SOURCE_CHAT_ID}  PRINCIPAL={TARGET_CHAT_ID}")
 
 # -------------------------------------------------------
+# helpers
+# -------------------------------------------------------
+def _poll_payload_from_raw(raw: dict) -> Tuple[dict, bool]:
+    """
+    Extrae un payload listo para send_poll a partir de raw['poll'].
+    Devuelve (kwargs, is_quiz).
+    """
+    p = raw.get("poll") or {}
+    question = p.get("question", "Pregunta")
+    options  = [o.get("text", "") for o in p.get("options", [])]
+    is_anon  = p.get("is_anonymous", True)
+    allows_multiple = p.get("allows_multiple_answers", False)
+    ptype = p.get("type", "regular")
+    is_quiz = (ptype == "quiz")
+
+    kwargs = dict(
+        chat_id=TARGET_CHAT_ID,
+        question=question,
+        options=options,
+        is_anonymous=is_anon,
+        allows_multiple_answers=allows_multiple
+    )
+
+    # Quiz: respuesta correcta
+    if is_quiz and p.get("correct_option_id") is not None:
+        kwargs["type"] = "quiz"
+        kwargs["correct_option_id"] = int(p["correct_option_id"])
+
+    # Tiempos (si existieran)
+    if p.get("open_period") is not None:
+        try:
+            kwargs["open_period"] = int(p["open_period"])
+        except Exception:
+            pass
+    if p.get("close_date") is not None:
+        try:
+            kwargs["close_date"] = int(p["close_date"])
+        except Exception:
+            pass
+
+    # Explicación (para quiz) — Telegram soporta explanation solo para quiz en sendPoll
+    if is_quiz and p.get("explanation"):
+        kwargs["explanation"] = str(p["explanation"])
+
+    return kwargs, is_quiz
+
+# -------------------------------------------------------
 # Publicar todos los borradores pendientes en orden
 # -------------------------------------------------------
-async def _publicar_todo(context: ContextTypes.DEFAULT_TYPE) -> int:
+async def _publicar_todo(context: ContextTypes.DEFAULT_TYPE) -> Tuple[int, int]:
     rows = get_unsent_drafts(DB_FILE)  # [(message_id, text, raw_json)]
     if not rows:
-        return 0
+        return 0, 0
 
-    enviados = []
+    publicados, fallidos = 0, 0
+    enviados_ids = []
+
     for mid, _t, raw in rows:
         try:
             data = json.loads(raw or "{}")
@@ -47,33 +99,37 @@ async def _publicar_todo(context: ContextTypes.DEFAULT_TYPE) -> int:
             data = {}
 
         try:
-            # Si es encuesta, reconstruir
+            # ---- Encuesta: RECONSTRUIR ----
             if "poll" in data:
-                p = data["poll"]
-                question = p.get("question", "Pregunta")
-                options = [o.get("text", "") for o in p.get("options", [])]
-                is_anon = p.get("is_anonymous", True)
-                poll_type = p.get("type", "regular")
-                kwargs = dict(chat_id=TARGET_CHAT_ID, question=question, options=options, is_anonymous=is_anon)
-                if poll_type == "quiz":
-                    kwargs["type"] = "quiz"
-                    if p.get("correct_option_id") is not None:
-                        kwargs["correct_option_id"] = p["correct_option_id"]
+                kwargs, _is_quiz = _poll_payload_from_raw(data)
                 await context.bot.send_poll(**kwargs)
+                publicados += 1
+
+            # ---- Resto: copiar tal cual ----
             else:
-                # Cualquier otro mensaje: copiar tal cual
                 await context.bot.copy_message(
                     chat_id=TARGET_CHAT_ID,
                     from_chat_id=SOURCE_CHAT_ID,
                     message_id=mid
                 )
-            enviados.append(mid)
+                publicados += 1
+
+            enviados_ids.append(mid)
+
+        except (Forbidden, BadRequest) as e:
+            # permisos / formato
+            fallidos += 1
+            logger.error(f"Falló publicar {mid}: {e}")
+        except TelegramError as e:
+            fallidos += 1
+            logger.error(f"TelegramError publicando {mid}: {e}")
         except Exception as e:
+            fallidos += 1
             logger.exception(f"Error publicando {mid}: {e}")
 
-    if enviados:
-        mark_sent(DB_FILE, enviados)
-    return len(enviados)
+    if enviados_ids:
+        mark_sent(DB_FILE, enviados_ids)
+    return publicados, fallidos
 
 # -------------------------------------------------------
 # Handler único de POSTS en el CANAL BORRADOR
@@ -83,7 +139,6 @@ async def handle_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
     if msg.chat_id != SOURCE_CHAT_ID:
-        # Ignorar otros canales donde el bot pueda ser admin
         return
 
     txt = (msg.text or "").strip()
@@ -113,8 +168,11 @@ async def handle_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if txt.startswith("/enviar") or txt.startswith("/enviar_casos_clinicos"):
-        n = await _publicar_todo(context)
-        await context.bot.send_message(SOURCE_CHAT_ID, f"✅ Publicados {n} mensaje(s).")
+        ok, fail = await _publicar_todo(context)
+        msg = f"✅ Publicados {ok} mensaje(s)."
+        if fail:
+            msg += f" ⚠️ Fallidos: {fail} (revisa permisos del canal destino, especialmente ENCUESTAS)."
+        await context.bot.send_message(SOURCE_CHAT_ID, msg)
         return
 
     if txt.startswith("/programar"):
@@ -128,8 +186,11 @@ async def handle_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             seconds = max(0, int((when - datetime.now()).total_seconds()))
 
             async def job(ctx: ContextTypes.DEFAULT_TYPE):
-                n = await _publicar_todo(ctx)
-                await ctx.bot.send_message(SOURCE_CHAT_ID, f"⏱️ Programación ejecutada. Publicados {n}.")
+                ok, fail = await _publicar_todo(ctx)
+                msg = f"⏱️ Programación ejecutada. Publicados {ok}."
+                if fail:
+                    msg += f" Fallidos: {fail}."
+                await ctx.bot.send_message(SOURCE_CHAT_ID, msg)
 
             context.job_queue.run_once(lambda ctx: job(ctx), when=seconds)
             await context.bot.send_message(SOURCE_CHAT_ID, f"🗓️ Programado para {when:%Y-%m-%d %H:%M}.")
