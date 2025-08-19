@@ -29,7 +29,6 @@ def save_draft(db_file: str, message_id: int, text: str, raw_json: str) -> None:
         c.commit()
 
 def get_unsent_drafts(db_file: str):
-    """[(message_id, text, raw_json)] en orden."""
     with _conn(db_file) as c:
         cur = c.execute(
             "SELECT message_id, COALESCE(text,''), COALESCE(raw_json,'') "
@@ -45,7 +44,6 @@ def mark_sent(db_file: str, ids) -> None:
         c.commit()
 
 def list_drafts(db_file: str):
-    """Para /listar: [(message_id, text)]"""
     with _conn(db_file) as c:
         cur = c.execute(
             "SELECT message_id, COALESCE(text,'') FROM drafts WHERE is_sent=0 ORDER BY message_id ASC"
