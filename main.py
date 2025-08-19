@@ -21,7 +21,7 @@ from database import (
 # =========================
 # CONFIG (usa ENV si existen; si no, usa estos valores)
 # =========================
-BOT_TOKEN      = os.getenv("BOT_TOKEN", "8400444635:AAFPehmdHwvL2Ho2WE_81GwlEaNhYfmE4vs")
+BOT_TOKEN      = os.getenv("BOT_TOKEN", "8400444635:AAEM4pm4vWtiFIWq9ECe7VWeI9lm6UsLgM4")
 SOURCE_CHAT_ID = int(os.getenv("SOURCE_CHAT_ID", "-1002859784457"))   # BORRADOR
 TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "-1002679848195"))  # PRINCIPAL
 DB_FILE = "drafts.db"
