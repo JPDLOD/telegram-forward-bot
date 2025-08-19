@@ -1,0 +1,9 @@
+.env
+*.sqlite
+*.sqlite3
+queue.sqlite3
+drafts.db
+__pycache__/
+*.pyc
+.venv/
+venv/
