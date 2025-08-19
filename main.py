@@ -19,12 +19,11 @@ from database import (
 )
 
 # =========================
-# CONFIG (TOKEN SOLO POR ENV)
+# CONFIG (TOKEN SOLO POR ENV) — NO DEFAULT
 # =========================
-# IMPORTANTE: No hay valor por defecto. Si falta, revienta con error claro.
-BOT_TOKEN = os.environ["BOT_TOKEN"]  # <- Solo Render Environment
-SOURCE_CHAT_ID = -1002859784457      # BORRADOR (fijo, como pediste)
-TARGET_CHAT_ID = -1002679848195      # PRINCIPAL (fijo, como pediste)
+BOT_TOKEN = os.environ["BOT_TOKEN"]  # obligatorio en Render
+SOURCE_CHAT_ID = -1002859784457      # BORRADOR (fijo)
+TARGET_CHAT_ID = -1002679848195      # PRINCIPAL (fijo)
 DB_FILE = "drafts.db"
 
 # ========= LOGGING =========
@@ -59,12 +58,10 @@ def _poll_payload_from_raw(raw: dict) -> Tuple[dict, bool]:
         allows_multiple_answers=allows_multiple
     )
 
-    # Quiz: respuesta correcta
     if is_quiz and p.get("correct_option_id") is not None:
         kwargs["type"] = "quiz"
         kwargs["correct_option_id"] = int(p["correct_option_id"])
 
-    # Tiempos (si existieran)
     if p.get("open_period") is not None:
         try:
             kwargs["open_period"] = int(p["open_period"])
@@ -76,7 +73,6 @@ def _poll_payload_from_raw(raw: dict) -> Tuple[dict, bool]:
         except Exception:
             pass
 
-    # Explicación (solo quiz)
     if is_quiz and p.get("explanation"):
         kwargs["explanation"] = str(p["explanation"])
 
@@ -105,9 +101,8 @@ async def _publicar_todo(context: ContextTypes.DEFAULT_TYPE) -> Tuple[int, int]:
                 kwargs, _is_quiz = _poll_payload_from_raw(data)
                 await context.bot.send_poll(**kwargs)
                 publicados += 1
-
-            # ---- Resto: copiar tal cual ----
             else:
+                # ---- Resto: copiar tal cual ----
                 await context.bot.copy_message(
                     chat_id=TARGET_CHAT_ID,
                     from_chat_id=SOURCE_CHAT_ID,
@@ -232,10 +227,10 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # En canales se usa MessageHandler con ChatType.CHANNEL
+    # Solo posts de canal
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel))
 
-    # Registrar error handler
+    # Error handler
     app.add_error_handler(on_error)
 
     logger.info("Bot iniciado 🚀 Escuchando channel_post en el BORRADOR.")
