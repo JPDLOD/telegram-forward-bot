@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import random
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import List, Optional, Tuple
 
 import aiosqlite
@@ -28,7 +28,6 @@ from telegram.ext import (
     MessageHandler,
     CommandHandler,
     filters,
-    JobQueue,
 )
 
 # -------------------------
@@ -41,13 +40,17 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"])  # Borrador
-TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"])  # Principal
+SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"])  # Canal BORRADOR
+TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"])  # Canal PUBLICACIÓN
 TZ_NAME = os.environ.get("TIMEZONE", "UTC")
 LOCAL_TZ = ZoneInfo(TZ_NAME)
 
-# Pausa base entre envíos para respetar límites de Telegram
-PAUSE_MS = int(os.environ.get("PAUSE", "1000"))  # milisegundos
+# PAUSE: segundos entre mensajes (float aceptado: "0.6", "1", etc.)
+_raw = os.environ.get("PAUSE", "1.0")
+try:
+    PAUSE_SEC = float(_raw)
+except Exception:
+    PAUSE_SEC = 1.0  # fallback seguro
 
 DB_PATH = "bot.sqlite3"
 
@@ -64,10 +67,12 @@ CREATE TABLE IF NOT EXISTS drafts(
     poll_question TEXT,
     poll_options TEXT,                       -- opciones separadas por \n
     deleted INTEGER NOT NULL DEFAULT 0,      -- 0/1 soft delete
-    pinned INTEGER NOT NULL DEFAULT 0,       -- fue mensaje de pin? (no deberíamos guardarlos)
-    bot_generated INTEGER NOT NULL DEFAULT 0,-- mensajes del bot (no se guardan, por seguridad extra)
+    pinned INTEGER NOT NULL DEFAULT 0,       -- mensaje de pin/servicio (NO listar)
+    bot_generated INTEGER NOT NULL DEFAULT 0,-- mensajes del bot (NO listar)
     created_at INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_drafts_active
+  ON drafts(deleted, pinned, bot_generated, source_msg_id);
 """
 
 SNIPPET_LEN = 80
@@ -75,7 +80,7 @@ SNIPPET_LEN = 80
 
 async def db_init():
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(CREATE_SQL)
+        await db.executescript(CREATE_SQL)
         await db.commit()
 
 
@@ -110,19 +115,35 @@ async def db_insert_draft(
         await db.commit()
 
 
-async def db_list_drafts() -> List[Tuple[int, int, str, str]]:
-    """Return list of (source_msg_id, kind, snippet, extra) for active, non-service, non-bot drafts."""
+async def db_list_drafts() -> List[Tuple[int, str, str, str]]:
+    """(msg_id, kind, snippet, poll_question) solo activos (no /eliminar, no pinned, no bot)."""
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             """
-            SELECT source_msg_id, kind, COALESCE(text_snippet, ''), COALESCE(poll_question, '')
+            SELECT source_msg_id, kind, COALESCE(text_snippet,''), COALESCE(poll_question,'')
             FROM drafts
             WHERE deleted=0 AND pinned=0 AND bot_generated=0
             ORDER BY source_msg_id ASC
             """
         )
-        rows = await cur.fetchall()
-        return [(r[0], r[1], r[2], r[3]) for r in rows]
+        return await cur.fetchall()
+
+
+async def db_counts_for_report() -> Tuple[int, int, int]:
+    """Devuelve (activos, eliminados, total_para_reporte = activos + eliminados)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT
+              SUM(CASE WHEN deleted=0 AND pinned=0 AND bot_generated=0 THEN 1 ELSE 0 END) AS activos,
+              SUM(CASE WHEN deleted=1 AND pinned=0 AND bot_generated=0 THEN 1 ELSE 0 END) AS eliminados
+            FROM drafts
+            """
+        )
+        row = await cur.fetchone()
+        activos = int(row[0] or 0)
+        eliminados = int(row[1] or 0)
+        return activos, eliminados, activos + eliminados
 
 
 async def db_mark_deleted(source_msg_id: int, deleted: int) -> bool:
@@ -147,8 +168,8 @@ async def db_get_draft(source_msg_id: int):
         return await cur.fetchone()
 
 
-async def db_all_to_publish() -> List[Tuple[int, str, Optional[str], Optional[str]]]:
-    """Return list of (source_msg_id, kind, poll_question, poll_options) filtered for publish."""
+async def db_all_active_to_publish() -> List[Tuple[int, str, Optional[str], Optional[str]]]:
+    """(source_msg_id, kind, poll_question, poll_options) activos para publicar."""
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             """
@@ -179,7 +200,6 @@ def make_snippet(text: Optional[str]) -> Optional[str]:
 
 
 def build_channel_link(chat_id: int, message_id: int) -> Optional[str]:
-    # Solo funciona si el usuario tiene acceso al canal
     s = str(chat_id)
     if s.startswith("-100"):
         short = s[4:]
@@ -187,15 +207,11 @@ def build_channel_link(chat_id: int, message_id: int) -> Optional[str]:
     return None
 
 
-def now_local_str() -> str:
-    return datetime.now(tz=LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
-
-
 async def gentle_pause():
-    # Pausa pseudo-aleatoria para repartir carga
-    base = max(200, PAUSE_MS)
-    extra = random.randint(-200, 300)
-    await asyncio.sleep((base + extra) / 1000)
+    # Pausa pseudo-aleatoria alrededor de PAUSE_SEC
+    base = max(0.2, PAUSE_SEC)
+    extra = random.uniform(-0.2, 0.3)
+    await asyncio.sleep(base + extra)
 
 
 # -------------------------
@@ -207,20 +223,20 @@ async def handle_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg or msg.chat_id != SOURCE_CHAT_ID:
         return
 
-    # 1) Ignorar mensajes de servicio (pinned, etc.)
+    # 1) Ignorar mensajes de servicio (pinned, joins, etc.)
     if msg.pinned_message or msg.new_chat_members or msg.left_chat_member:
         return
 
-    # 2) Ignorar comandos escritos en el canal (e.g., /listar)
+    # 2) Ignorar comandos / mensajes que empiezan con "/"
     if is_command_message_text(msg.text) or is_command_message_text(getattr(msg, "caption", None)):
         return
 
-    # 3) Ignorar mensajes del propio bot
+    # 3) Ignorar mensajes generados por el bot
     bot_generated = 1 if (msg.from_user and msg.from_user.is_bot) else 0
     if bot_generated:
         return
 
-    # 4) Detectar tipo y extraer snippet/datos de poll
+    # 4) Detectar tipo y extraer info
     kind = "text"
     snippet = None
     poll_q = None
@@ -236,7 +252,6 @@ async def handle_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kind = "text"
         snippet = make_snippet(msg.text)
     else:
-        # Medios: photo, video, audio, document, etc. Los copiamos con copyMessage.
         kind = "media"
         snippet = make_snippet(getattr(msg, "caption", None))
 
@@ -263,7 +278,7 @@ async def cmd_comandos(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• */deshacer* `<id>` — revierte un */eliminar* (o responde)\n"
         "• */enviar* — publica ahora\n"
         "• */programar* `YYYY-MM-DD HH:MM` — programa el envío\n"
-        "• */mensaje* `<id>` — muestra vista previa/enlace de ese borrador\n"
+        "• */mensaje* `<id>` — vista previa/enlace del borrador\n"
         "• */id* — responde a un mensaje para ver su id\n"
         "• */comandos* — muestra esta ayuda\n"
     )
@@ -328,7 +343,6 @@ async def cmd_eliminar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ok:
         await update.effective_message.reply_text(f"No encontré el id:{mid}.")
         return
-    # contar restantes
     rest = len(await db_list_drafts())
     await update.effective_message.reply_text(f"🗑️ Eliminado id:{mid}. Quedan {rest} en la cola.")
 
@@ -379,26 +393,17 @@ async def cmd_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def publish_all(context: ContextTypes.DEFAULT_TYPE) -> Tuple[int, int, int, int]:
-    """Devuelve (total, enviados, eliminados, fallidos)."""
-    drafts = await db_all_to_publish()
-    total = len(drafts)
-    if total == 0:
-        return (0, 0, 0, 0)
-
-    # Contar eliminados (soft delete ya filtrado), pero necesitamos contarlos si hubo antes
-    # Como ya están filtrados, "eliminados manualmente" se obtiene de diferencia con total en DB bruto si hiciera falta.
-    # Aquí contamos los que estaban marcados y no llegaron: 0 (porque no vienen). Mostramos 0/… como “Eliminados manualmente”.
-    eliminados = 0
+    """Devuelve (total_reportado, enviados, eliminados_manuales, fallidos)."""
+    activos, eliminados, total_report = await db_counts_for_report()
+    drafts = await db_all_active_to_publish()
 
     enviados = 0
     fallidos = 0
-
     bot = context.bot
 
     for (source_msg_id, kind, poll_question, poll_options) in drafts:
         try:
             if kind == "poll":
-                # recreate poll
                 options = (poll_options or "").split("\n") if poll_options else []
                 if not options or not poll_question:
                     raise BadRequest("Poll malformada")
@@ -410,7 +415,6 @@ async def publish_all(context: ContextTypes.DEFAULT_TYPE) -> Tuple[int, int, int
                     allows_multiple_answers=False,
                 )
             else:
-                # text/media -> copy
                 await bot.copy_message(
                     chat_id=TARGET_CHAT_ID,
                     from_chat_id=SOURCE_CHAT_ID,
@@ -424,7 +428,6 @@ async def publish_all(context: ContextTypes.DEFAULT_TYPE) -> Tuple[int, int, int
             wait = int(getattr(e, "retry_after", 3)) + 1
             log.warning("RetryAfter %ss (flood control). Esperando…", wait)
             await asyncio.sleep(wait)
-            # reintento único tras RetryAfter
             try:
                 if kind == "poll":
                     options = (poll_options or "").split("\n") if poll_options else []
@@ -446,10 +449,9 @@ async def publish_all(context: ContextTypes.DEFAULT_TYPE) -> Tuple[int, int, int
                 log.error("Falló tras RetryAfter id:%s -> %s", source_msg_id, e2)
                 fallidos += 1
 
-        except (TimedOut, NetworkError) as e:
-            # pequeños reintentos con backoff
+        except (TimedOut, NetworkError):
             ok = False
-            for attempt in range(3):
+            for _ in range(3):
                 await asyncio.sleep(3)
                 try:
                     if kind == "poll":
@@ -477,26 +479,22 @@ async def publish_all(context: ContextTypes.DEFAULT_TYPE) -> Tuple[int, int, int
                 fallidos += 1
 
         except (BadRequest, Forbidden) as e:
-            # Ej: "Message to copy not found", permisos, etc.
             log.error("No pude publicar id:%s -> %s", source_msg_id, e)
             fallidos += 1
 
-    return (total, enviados, eliminados, fallidos)
+    return (total_report, enviados, eliminados, fallidos)
 
 
 async def cmd_enviar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != SOURCE_CHAT_ID:
         return
     total, enviados, eliminados, fallidos = await publish_all(context)
-    # Nota: eliminados = mensajes que no entraron por /eliminar (ya filtrados), así que los calculamos:
-    vivos = await db_list_drafts()
-    # vivos len == total, porque list_drafts ya filtró. Para el reporte diferenciamos:
     texto = (
         f"✅ Publicados {enviados}.\n"
         f"📦 Resultado: {enviados}/{total} enviados."
     )
     if eliminados:
-        texto += f" 🗑️ Eliminados: {eliminados}."
+        texto += f" 🗑️ Omitidos por /eliminar: {eliminados}."
     if fallidos:
         texto += " ⚠️ Revisa permisos y flood control."
     await update.effective_message.reply_text(texto)
@@ -515,7 +513,6 @@ async def cmd_programar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("❌ Formato inválido. Ej: /programar 2025-08-20 07:00")
         return
 
-    # diferencia en segundos desde ahora
     now = datetime.now(tz=LOCAL_TZ)
     diff = (dt - now).total_seconds()
     if diff <= 0:
@@ -542,7 +539,7 @@ def main():
         .build()
     )
 
-    # Handlers de comandos
+    # Comandos
     app.add_handler(CommandHandler("comandos", cmd_comandos, filters.Chat(SOURCE_CHAT_ID)))
     app.add_handler(CommandHandler("listar", cmd_listar, filters.Chat(SOURCE_CHAT_ID)))
     app.add_handler(CommandHandler("id", cmd_id, filters.Chat(SOURCE_CHAT_ID)))
@@ -552,11 +549,10 @@ def main():
     app.add_handler(CommandHandler("enviar", cmd_enviar, filters.Chat(SOURCE_CHAT_ID)))
     app.add_handler(CommandHandler("programar", cmd_programar, filters.Chat(SOURCE_CHAT_ID)))
 
-    # Solo escuchamos publicaciones en el canal borrador
-    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, handle_channel))
+    # Escuchar publicaciones del canal BORRADOR
+    app.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel))
 
-    log.info("SQLite listo. BORRADOR=%s  PRINCIPAL=%s", SOURCE_CHAT_ID, TARGET_CHAT_ID)
-    log.info("Bot iniciado 🚀 Escuchando channel_post en el BORRADOR.")
+    log.info("SQLite listo. BORRADOR=%s  PUBLICACIÓN=%s  TZ=%s  PAUSE=%.3fs", SOURCE_CHAT_ID, TARGET_CHAT_ID, TZ_NAME, PAUSE_SEC)
     app.run_polling(allowed_updates=["channel_post", "message"], drop_pending_updates=True)
 
 
