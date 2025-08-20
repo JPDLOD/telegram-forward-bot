@@ -1,19 +1,26 @@
 # -*- coding: utf-8 -*-
 # BORRADOR (-1002859784457) -> PRINCIPAL (-1002679848195)
+# Guarda todo lo que publiques en BORRADOR y, al usar /enviar o /programar,
+# lo publica en PRINCIPAL en el MISMO ORDEN, sin "Forwarded from...".
+# Reconstruye encuestas y copia el resto de mensajes.
+#
+# Cambios clave:
+# - No guarda ni envía comandos (cualquier texto que empiece con '/').
+# - /remover por respuesta o por id; confirma y muestra conteo restante.
+# - /listar con índice limpio (#1, #2...) + id real para borrar exacto.
+# - Auto-rate-limit (PAUSE) + manejo 429 RetryAfter + reintentos TimedOut.
+# - /programar arreglado (YYYY-MM-DD HH:MM).
 
 import os
-import re
 import json
 import logging
+import asyncio
 from datetime import datetime
-from typing import Tuple, Optional, List
+from typing import Tuple
 
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
-from telegram.error import (
-    TelegramError, Forbidden, BadRequest, RetryAfter, TimedOut
-)
-from asyncio import sleep
+from telegram.error import TelegramError, Forbidden, BadRequest, RetryAfter, TimedOut
 
 from database import (
     init_db, save_draft, get_unsent_drafts, mark_sent, delete_draft, list_drafts
@@ -22,17 +29,22 @@ from database import (
 # =========================
 # CONFIG
 # =========================
-BOT_TOKEN      = os.environ["BOT_TOKEN"]                    # token solo por ENV
-SOURCE_CHAT_ID = -1002859784457                             # canal BORRADOR
-TARGET_CHAT_ID = -1002679848195                             # canal PRINCIPAL
-DB_FILE        = "drafts.db"
+# TOKEN solo por ENV (si falta, peta con error claro)
+BOT_TOKEN = os.environ["BOT_TOKEN"]
 
-PAUSE_BETWEEN  = float(os.getenv("PAUSE", "0.7"))           # seg entre envíos
-MAX_RETRIES    = int(os.getenv("MAX_RETRIES", "5"))         # reintentos por msg
+# IDs fijos como pediste (borra o cambia si algún día quieres leerlos de ENV)
+SOURCE_CHAT_ID = -1002859784457      # BORRADOR
+TARGET_CHAT_ID = -1002679848195      # PRINCIPAL
+
+# Pausa base entre envíos para no gatillar flood control (se puede ajustar en Render)
+PAUSE = float(os.getenv("PAUSE", "0.6"))
+if PAUSE < 0:
+    PAUSE = 0.0
+
+DB_FILE = "drafts.db"
 
 # ========= LOGGING =========
-logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s",
-                    level=logging.INFO)
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ========= DB =========
@@ -83,123 +95,149 @@ def _poll_payload_from_raw(raw: dict) -> Tuple[dict, bool]:
 
     return kwargs, is_quiz
 
-def _label_from_raw(raw_json: str, fallback_text: str) -> str:
-    """
-    Para /listar: genera una etiqueta amigable si el texto está vacío.
-    """
-    try:
-        d = json.loads(raw_json or "{}")
-    except Exception:
-        d = {}
-    if "poll" in d:
+def _snippet_from_msg(msg) -> str:
+    """Texto corto para /listar cuando no hay caption/text."""
+    if msg.text:
+        return msg.text
+    if msg.caption:
+        return msg.caption
+    if getattr(msg, "poll", None):
         return "[encuesta]"
-    for media_key, label in [
-        ("photo", "[imagen]"),
-        ("video", "[video]"),
-        ("animation", "[gif]"),
-        ("document", "[archivo]"),
-        ("audio", "[audio]"),
-        ("voice", "[nota de voz]"),
-    ]:
-        if d.get(media_key):
-            return label
-    t = (fallback_text or "").strip()
-    return t if t else "[mensaje]"
+    if getattr(msg, "photo", None):
+        return "[foto]"
+    if getattr(msg, "video", None):
+        return "[video]"
+    if getattr(msg, "document", None):
+        return "[documento]"
+    if getattr(msg, "audio", None):
+        return "[audio]"
+    if getattr(msg, "voice", None):
+        return "[nota de voz]"
+    return "[mensaje]"
 
-async def _send_one(context: ContextTypes.DEFAULT_TYPE, mid: int, raw_json: str) -> None:
-    """
-    Envía 1 mensaje (o encuesta) con reintentos, manejando:
-      - TimedOut
-      - RetryAfter (flood control)
-      - BadRequest específicos
-    Lanza excepción si, tras reintentos, no se logró.
-    """
-    # ¿Es encuesta?
-    data = {}
-    try:
-        data = json.loads(raw_json or "{}")
-    except Exception:
-        pass
+def _parse_id_arg(txt: str) -> int | None:
+    """Soporta '/remover 303', '/remover id:303', '/remover id=303'."""
+    parts = txt.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        return None
+    raw = parts[1].strip()
+    for pref in ("id:", "id=", "ID:", "ID="):
+        if raw.startswith(pref):
+            raw = raw[len(pref):].strip()
+            break
+    return int(raw) if raw.isdigit() else None
 
-    for attempt in range(1, MAX_RETRIES + 1):
+# -------------------------------------------------------
+# Envío con control de tasa y reintentos
+# -------------------------------------------------------
+async def _send_with_guard(coro_func, *, description: str) -> bool:
+    """
+    Ejecuta una corrutina que llama al API de Telegram con manejo de:
+      - RetryAfter (429) -> espera e intenta de nuevo
+      - TimedOut -> reintentos con backoff
+    Devuelve True si se logró enviar, False si fallo definitivo.
+    """
+    # backoff para TimedOut
+    max_retries = 3
+    attempt = 0
+    while True:
         try:
-            if "poll" in data:
-                kwargs, _ = _poll_payload_from_raw(data)
-                await context.bot.send_poll(**kwargs)
-            else:
-                await context.bot.copy_message(
-                    chat_id=TARGET_CHAT_ID,
-                    from_chat_id=SOURCE_CHAT_ID,
-                    message_id=mid
-                )
-            # éxito
-            return
+            await coro_func()
+            # pausa corta entre envíos siempre
+            if PAUSE > 0:
+                await asyncio.sleep(PAUSE)
+            return True
 
         except RetryAfter as e:
-            wait = max(int(getattr(e, "retry_after", 3)), 3)
-            logger.warning(f"[{mid}] Flood control (RetryAfter). Esperando {wait}s (intento {attempt}/{MAX_RETRIES})")
-            await sleep(wait)
+            wait = int(getattr(e, "retry_after", 1)) + 1
+            logger.warning(f"429 RetryAfter en {description}. Esperando {wait}s …")
+            await asyncio.sleep(wait)
+            # y reintenta
 
         except TimedOut:
-            wait = 3 + attempt  # backoff suave
-            logger.warning(f"[{mid}] Timed out. Reintentando en {wait}s (intento {attempt}/{MAX_RETRIES})")
-            await sleep(wait)
-
-        except BadRequest as e:
-            msg = str(e)
-            # Parseo de "Flood control exceeded. Retry in X seconds"
-            m = re.search(r"Retry in (\d+) seconds", msg)
-            if m:
-                wait = max(int(m.group(1)), 3)
-                logger.warning(f"[{mid}] Flood control (429). Esperando {wait}s (intento {attempt}/{MAX_RETRIES})")
-                await sleep(wait)
-                continue
-
-            if "Message to copy not found" in msg:
-                # No existe en el canal origen (borrado). No vale la pena reintentar más.
-                raise
-
-            # Otros BadRequest: un pequeño backoff y reintento
-            wait = min(5 + attempt, 10)
-            logger.warning(f"[{mid}] BadRequest: {msg}. Esperando {wait}s (intento {attempt}/{MAX_RETRIES})")
-            await sleep(wait)
-
-        except TelegramError as e:
-            # Cualquier otro error de red temporal
-            wait = min(5 + 2*attempt, 20)
-            logger.warning(f"[{mid}] TelegramError: {e}. Esperando {wait}s (intento {attempt}/{MAX_RETRIES})")
-            await sleep(wait)
-
-    # Si salió del bucle, no se logró
-    raise TelegramError(f"Fallo definitivo tras {MAX_RETRIES} intentos")
+            attempt += 1
+            if attempt > max_retries:
+                logger.error(f"Timed out repetido en {description}. Abortando.")
+                return False
+            wait = max(PAUSE, 0.5) * (2 ** attempt)
+            logger.warning(f"Timed out en {description}. Reintento {attempt}/{max_retries} en {wait:.1f}s …")
+            await asyncio.sleep(wait)
 
 # -------------------------------------------------------
 # Publicar todos los borradores pendientes en orden
 # -------------------------------------------------------
-async def _publicar_todo(context: ContextTypes.DEFAULT_TYPE) -> Tuple[int, int, List[int]]:
+async def _publicar_todo(context: ContextTypes.DEFAULT_TYPE) -> Tuple[int, int, int]:
     rows = get_unsent_drafts(DB_FILE)  # [(message_id, text, raw_json)]
+    total = len(rows)
     if not rows:
-        return 0, 0, []
+        return 0, 0, 0
 
-    ok, fail = 0, 0
-    enviados_ids: List[int] = []
-    fallidos_ids: List[int] = []
+    publicados, fallidos, descartados = 0, 0, 0
+    enviados_ids = []
 
     for mid, _t, raw in rows:
+        # parse del raw
         try:
-            await _send_one(context, mid, raw)
-            mark_sent(DB_FILE, [mid])
-            enviados_ids.append(mid)
-            ok += 1
-            # Pausa preventiva entre mensajes
-            await sleep(PAUSE_BETWEEN)
+            data = json.loads(raw or "{}")
+        except Exception:
+            data = {}
+
+        try:
+            # ---- Encuesta: RECONSTRUIR ----
+            if "poll" in data:
+                kwargs, _ = _poll_payload_from_raw(data)
+                ok = await _send_with_guard(
+                    lambda: context.bot.send_poll(**kwargs),
+                    description=f"send_poll(mid={mid})"
+                )
+                if ok:
+                    publicados += 1
+                    enviados_ids.append(mid)
+                else:
+                    fallidos += 1
+
+            # ---- Resto: copiar tal cual ----
+            else:
+                async def do_copy():
+                    return await context.bot.copy_message(
+                        chat_id=TARGET_CHAT_ID,
+                        from_chat_id=SOURCE_CHAT_ID,
+                        message_id=mid
+                    )
+
+                ok = await _send_with_guard(do_copy, description=f"copy_message(mid={mid})")
+                if ok:
+                    publicados += 1
+                    enviados_ids.append(mid)
+                else:
+                    fallidos += 1
+
+        except BadRequest as e:
+            # 400 típicos: "Message to copy not found" -> lo quitamos de la cola
+            emsg = str(e)
+            if "Message to copy not found" in emsg:
+                logger.error(f"BadRequest: original {mid} ya no existe. Se elimina de la cola.")
+                delete_draft(DB_FILE, mid)
+                descartados += 1
+            else:
+                logger.error(f"BadRequest publicando {mid}: {e}")
+                fallidos += 1
+
+        except (Forbidden,) as e:
+            fallidos += 1
+            logger.error(f"Forbidden publicando {mid}: {e}")
+
+        except TelegramError as e:
+            fallidos += 1
+            logger.error(f"TelegramError publicando {mid}: {e}")
 
         except Exception as e:
-            fail += 1
-            fallidos_ids.append(mid)
-            logger.error(f"Error publicando {mid}: {e}")
+            fallidos += 1
+            logger.exception(f"Error publicando {mid}: {e}")
 
-    return ok, fail, fallidos_ids
+    if enviados_ids:
+        mark_sent(DB_FILE, enviados_ids)
+    return publicados, fallidos, descartados
 
 # -------------------------------------------------------
 # Handler único de POSTS en el CANAL BORRADOR
@@ -212,88 +250,127 @@ async def handle_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     txt = (msg.text or "").strip()
+    is_command = txt.startswith("/")
 
-    # --------- COMANDOS (como posts del canal) ----------
-    if txt.startswith("/listar"):
-        drafts = list_drafts(DB_FILE)  # [(message_id, text, raw_json)]
-        if not drafts:
-            await context.bot.send_message(SOURCE_CHAT_ID, "📂 No hay borradores.")
+    # --------- COMANDOS ----------
+    if is_command:
+        low = txt.lower()
+
+        # /listar
+        if low.startswith("/listar") or low.startswith("/lista"):
+            drafts = list_drafts(DB_FILE)
+            if not drafts:
+                await context.bot.send_message(SOURCE_CHAT_ID, "📂 No hay borradores.")
+                return
+            out = ["📋 Borradores pendientes:"]
+            for i, (did, snip) in enumerate(drafts, start=1):
+                s = (snip or "")
+                if len(s) > 80:
+                    s = s[:80] + "…"
+                out.append(f"• #{i} — {s}  (id:{did})")
+            await context.bot.send_message(SOURCE_CHAT_ID, "\n".join(out))
             return
 
-        out = ["📋 Borradores pendientes:"]
-        # Enumeración 1..N (no IDs), con etiquetas para medios/encuestas
-        for idx, (mid, snip, rawj) in enumerate(drafts, start=1):
-            label = _label_from_raw(rawj, snip)
-            shown = (label[:60] + "…") if len(label) > 60 else label
-            out.append(f"• {idx:02d} — {shown}  (id:{mid})")
+        # /remover | /borrar | /eliminar | /remove
+        if (low.startswith("/remover") or low.startswith("/borrar")
+            or low.startswith("/eliminar") or low.startswith("/remove")):
 
-        await context.bot.send_message(SOURCE_CHAT_ID, "\n".join(out))
-        return
+            # 1) si es reply, usamos ese id
+            rid = msg.reply_to_message.message_id if msg.reply_to_message else None
 
-    if txt.startswith("/borrar"):
-        parts = txt.split()
-        if len(parts) == 2 and parts[1].isdigit():
-            delete_draft(DB_FILE, int(parts[1]))
-            await context.bot.send_message(SOURCE_CHAT_ID, f"🗑️ Borrador {parts[1]} eliminado.")
-        else:
-            await context.bot.send_message(SOURCE_CHAT_ID, "❌ Usa: /borrar <message_id>")
-        return
+            # 2) o si pasó un número/id:NUM
+            if rid is None:
+                rid = _parse_id_arg(txt)
 
-    if txt.startswith("/enviar") or txt.startswith("/enviar_casos_clinicos"):
-        ok, fail, fallidos = await _publicar_todo(context)
-        resumen = f"✅ Publicados {ok}. "
-        if fail:
-            resumen += f"⚠️ Fallidos: {fail}. Pendientes: {', '.join(map(str, fallidos[:10]))}"
-            if len(fallidos) > 10:
-                resumen += "…"
-        total = ok + fail
-        resumen += f"\n📦 Resultado: {ok}/{total} enviados."
-        await context.bot.send_message(SOURCE_CHAT_ID, resumen)
-        return
+            if rid is None:
+                await context.bot.send_message(
+                    SOURCE_CHAT_ID,
+                    "❌ Usa: responde a un mensaje con /remover, o /remover <id> (también 'id:123')."
+                )
+                return
 
-    if txt.startswith("/programar"):
+            delete_draft(DB_FILE, int(rid))
+            remaining = len(list_drafts(DB_FILE))
+            await context.bot.send_message(
+                SOURCE_CHAT_ID,
+                f"🗑️ Eliminado id:{rid}. Quedan {remaining} en la cola."
+            )
+            return
+
+        # /enviar
+        if low.startswith("/enviar") or low.startswith("/enviar_casos_clinicos"):
+            total_antes = len(list_drafts(DB_FILE))
+            ok, fail, skipped = await _publicar_todo(context)
+            msg_out = f"✅ Publicados {ok}."
+            msg_out += f"\n📦 Resultado: {ok}/{total_antes} enviados."
+            if skipped:
+                msg_out += f"\n♻️ Descartados (faltaba original): {skipped}."
+            if fail:
+                msg_out += f"\n⚠️ Fallidos: {fail}."
+            await context.bot.send_message(SOURCE_CHAT_ID, msg_out)
+            return
+
         # /programar YYYY-MM-DD HH:MM
-        parts = txt.split()
-        if len(parts) < 3:
-            await context.bot.send_message(SOURCE_CHAT_ID, "⏰ Usa: /programar YYYY-MM-DD HH:MM")
+        if low.startswith("/programar"):
+            parts = txt.split()
+            if len(parts) < 3:
+                await context.bot.send_message(SOURCE_CHAT_ID, "⏰ Usa: /programar YYYY-MM-DD HH:MM")
+                return
+            try:
+                when_dt = datetime.strptime(parts[1] + " " + parts[2], "%Y-%m-%d %H:%M")
+                # segundos desde ahora (si ya pasó, será 0 → ejecuta inmediato)
+                seconds = max(0, int((when_dt - datetime.now()).total_seconds()))
+
+                async def job(ctx: ContextTypes.DEFAULT_TYPE):
+                    total_prev = len(list_drafts(DB_FILE))
+                    ok, fail, skipped = await _publicar_todo(ctx)
+                    msg2 = f"⏱️ Programación ejecutada. Publicados {ok}."
+                    msg2 += f"\n📦 Resultado: {ok}/{total_prev} enviados."
+                    if skipped:
+                        msg2 += f"\n♻️ Descartados: {skipped}."
+                    if fail:
+                        msg2 += f"\n⚠️ Fallidos: {fail}."
+                    await ctx.bot.send_message(SOURCE_CHAT_ID, msg2)
+
+                # PTB acepta float de segundos directamente
+                context.job_queue.run_once(job, when=seconds)
+                await context.bot.send_message(SOURCE_CHAT_ID, f"🗓️ Programado para {when_dt:%Y-%m-%d %H:%M}.")
+            except ValueError:
+                await context.bot.send_message(SOURCE_CHAT_ID, "❌ Formato inválido. Ej: /programar 2025-08-20 07:00")
+            except Exception as e:
+                logger.exception("Error al programar", exc_info=e)
+                await context.bot.send_message(SOURCE_CHAT_ID, "❌ No pude programar. Revisa el formato e inténtalo de nuevo.")
             return
-        try:
-            when = datetime.strptime(parts[1] + " " + parts[2], "%Y-%m-%d %H:%M")
-            seconds = max(0, int((when - datetime.now()).total_seconds()))
 
-            async def job(ctx: ContextTypes.DEFAULT_TYPE):
-                ok, fail, _ = await _publicar_todo(ctx)
-                msg2 = f"⏱️ Programación ejecutada. Publicados {ok}. Fallidos {fail}."
-                await ctx.bot.send_message(SOURCE_CHAT_ID, msg2)
+        # /id
+        if low.startswith("/id"):
+            await context.bot.send_message(
+                SOURCE_CHAT_ID,
+                f"BORRADOR: `{SOURCE_CHAT_ID}`\nPRINCIPAL: `{TARGET_CHAT_ID}`",
+                parse_mode="Markdown"
+            )
+            return
 
-            context.job_queue.run_once(lambda ctx: job(ctx), when=seconds)
-            await context.bot.send_message(SOURCE_CHAT_ID, f"🗓️ Programado para {when:%Y-%m-%d %H:%M}.")
-        except Exception:
-            await context.bot.send_message(SOURCE_CHAT_ID, "❌ Formato inválido. Ej: /programar 2025-08-20 07:00")
-        return
+        # /ayuda o /start
+        if low.startswith("/ayuda") or low.startswith("/start"):
+            await context.bot.send_message(
+                SOURCE_CHAT_ID,
+                "Comandos:\n"
+                "• /listar — muestra borradores (con id)\n"
+                "• /remover <id> — elimina de la cola (o responde a un mensaje con /remover)\n"
+                "• /enviar — publica ahora\n"
+                "• /programar YYYY-MM-DD HH:MM — programa el envío\n"
+                "• /id — muestra IDs\n"
+                f"• Pausa actual: {PAUSE:.2f}s entre mensajes"
+            )
+            return
 
-    if txt.startswith("/id"):
-        await context.bot.send_message(
-            SOURCE_CHAT_ID,
-            f"BORRADOR: `{SOURCE_CHAT_ID}`\nPRINCIPAL: `{TARGET_CHAT_ID}`",
-            parse_mode="Markdown"
-        )
-        return
-
-    if txt.startswith("/ayuda") or txt.startswith("/start"):
-        await context.bot.send_message(
-            SOURCE_CHAT_ID,
-            "Comandos:\n"
-            "• /listar — muestra borradores (enumerados 1..N)\n"
-            "• /borrar <message_id> — elimina de la cola\n"
-            "• /enviar — publica ahora (con reintentos y pausa)\n"
-            "• /programar YYYY-MM-DD HH:MM — programa el envío\n"
-            "• /id — muestra IDs"
-        )
-        return
+        # Cualquier otro comando desconocido: NO guardar, avisar breve
+        await context.bot.send_message(SOURCE_CHAT_ID, "🤖 Comando no reconocido. Usa /ayuda.")
+        return  # <- importante: NO guardar comandos
 
     # --------- SI NO ES COMANDO → GUARDAR BORRADOR ----------
-    snippet = msg.text or msg.caption or ""
+    snippet = _snippet_from_msg(msg)
     raw_json = json.dumps(msg.to_dict(), ensure_ascii=False)
     save_draft(DB_FILE, msg.message_id, snippet, raw_json)
     logger.info(f"Guardado en borrador: {msg.message_id}")
@@ -309,6 +386,7 @@ def main():
     # En canales se usa MessageHandler con ChatType.CHANNEL
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel))
 
+    # Registrar error handler
     app.add_error_handler(on_error)
 
     logger.info("Bot iniciado 🚀 Escuchando channel_post en el BORRADOR.")
