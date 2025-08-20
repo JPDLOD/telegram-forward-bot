@@ -76,39 +76,30 @@ def _poll_payload_from_raw(raw: dict) -> Tuple[dict, bool]:
     ptype = p.get("type", "regular")
     is_quiz = (ptype == "quiz")
 
-    # base común
     kwargs = dict(
         chat_id=TARGET_CHAT_ID,
         question=question,
         options=options,
         is_anonymous=is_anon,
+        allows_multiple_answers=allows_multiple
     )
 
-    if is_quiz:
-        # 🔴 Forzar explícitamente quiz
+    # Quiz: respuesta correcta
+    if is_quiz and p.get("correct_option_id") is not None:
         kwargs["type"] = "quiz"
-        # correct_option_id puede ser 0 → no uses truthiness
-        if "correct_option_id" in p and p.get("correct_option_id") is not None:
-            try:
-                kwargs["correct_option_id"] = int(p["correct_option_id"])
-            except Exception:
-                pass
-        # explicación si existe
-        if p.get("explanation"):
-            kwargs["explanation"] = str(p["explanation"])
-        # Nota: NO mandamos allows_multiple_answers en quiz (no aplica)
-    else:
-        # encuesta regular
-        kwargs["allows_multiple_answers"] = bool(allows_multiple)
-        # (type regular puede omitirse; Telegram lo asume por defecto)
+        kwargs["correct_option_id"] = int(p["correct_option_id"])
 
-        # tiempos también aplican; en quiz los dejamos por compatibilidad
+    # Tiempos (si existieran)
     if p.get("open_period") is not None:
         try: kwargs["open_period"] = int(p["open_period"])
         except Exception: pass
     if p.get("close_date") is not None:
         try: kwargs["close_date"] = int(p["close_date"])
         except Exception: pass
+
+    # Explicación (solo quiz)
+    if is_quiz and p.get("explanation"):
+        kwargs["explanation"] = str(p["explanation"])
 
     return kwargs, is_quiz
 
