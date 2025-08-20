@@ -1,559 +1,458 @@
+# -*- coding: utf-8 -*-
+# BORRADOR (SOURCE_CHAT_ID) -> PRINCIPAL (TARGET_CHAT_ID)
+# Guarda todo lo que publiques en BORRADOR y, al usar /enviar o /programar,
+# lo publica en PRINCIPAL en el MISMO ORDEN, sin "Forwarded from...".
+# Reconstruye encuestas (quiz/regular) y copia el resto de mensajes.
+#
+# Comandos en el canal BORRADOR:
+#   /listar
+#   /eliminar <id>  (alias: /borrar, /remover, /delete) o responder con el comando
+#   /deshacer [id]  (alias: /undo, /restaurar) o responder con el comando
+#   /mensaje <id>   — señala/da link a ese borrador
+#   /enviar
+#   /programar YYYY-MM-DD HH:MM
+#   /id
+#   /comandos  (alias: /ayuda, /start)
+#
+# NOTA: Los mensajes que empiecen por "/" NO se guardan como borradores.
+#       También se ignoran mensajes fijados (pinned/service) y mensajes del propio bot.
+
+import os
+import re
+import json
 import asyncio
 import logging
-import os
-import random
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import Tuple, Optional
 
-import aiosqlite
 from zoneinfo import ZoneInfo
 
-from telegram import (
-    Update,
-    constants,
-    Poll,
-)
+from telegram import Update
+from telegram.ext import Application, MessageHandler, ContextTypes, filters
 from telegram.error import (
-    BadRequest,
-    Forbidden,
-    NetworkError,
-    RetryAfter,
-    TimedOut,
-)
-from telegram.ext import (
-    Application,
-    ApplicationBuilder,
-    AIORateLimiter,
-    ContextTypes,
-    MessageHandler,
-    CommandHandler,
-    filters,
+    TelegramError, Forbidden, BadRequest, RetryAfter, TimedOut, NetworkError
 )
 
-# -------------------------
-# Config & Logger
-# -------------------------
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+from database import (
+    init_db, save_draft, get_unsent_drafts, mark_sent, list_drafts,
+    mark_deleted, restore_draft, get_last_deleted, count_deleted_unsent, get_draft_snippet
 )
-log = logging.getLogger(__name__)
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-SOURCE_CHAT_ID = int(os.environ["SOURCE_CHAT_ID"])  # Canal BORRADOR
-TARGET_CHAT_ID = int(os.environ["TARGET_CHAT_ID"])  # Canal PUBLICACIÓN
-TZ_NAME = os.environ.get("TIMEZONE", "UTC")
-LOCAL_TZ = ZoneInfo(TZ_NAME)
+# =========================
+# CONFIG DESDE ENV
+# =========================
+BOT_TOKEN = os.environ["BOT_TOKEN"]  # obligatorio
+SOURCE_CHAT_ID = int(os.environ.get("SOURCE_CHAT_ID", "-1002859784457"))
+TARGET_CHAT_ID = int(os.environ.get("TARGET_CHAT_ID", "-1002679848195"))
+DB_FILE = "drafts.db"
 
-# PAUSE: segundos entre mensajes (float aceptado: "0.6", "1", etc.)
-_raw = os.environ.get("PAUSE", "1.0")
-try:
-    PAUSE_SEC = float(_raw)
-except Exception:
-    PAUSE_SEC = 1.0  # fallback seguro
+# pausa base entre envíos (seg) para no rozar el flood control
+PAUSE = float(os.environ.get("PAUSE", "0.6"))
+TZNAME = os.environ.get("TIMEZONE", "UTC")
+TZ = ZoneInfo(TZNAME)
 
-DB_PATH = "bot.sqlite3"
+# ========= LOGGING =========
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# -------------------------
-# DB helpers (aiosqlite)
-# -------------------------
-CREATE_SQL = """
-CREATE TABLE IF NOT EXISTS drafts(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id INTEGER NOT NULL,
-    source_msg_id INTEGER NOT NULL UNIQUE,
-    kind TEXT NOT NULL,                      -- text|media|poll
-    text_snippet TEXT,                       -- primeras ~80 chars del texto/caption
-    poll_question TEXT,
-    poll_options TEXT,                       -- opciones separadas por \n
-    deleted INTEGER NOT NULL DEFAULT 0,      -- 0/1 soft delete
-    pinned INTEGER NOT NULL DEFAULT 0,       -- mensaje de pin/servicio (NO listar)
-    bot_generated INTEGER NOT NULL DEFAULT 0,-- mensajes del bot (NO listar)
-    created_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_drafts_active
-  ON drafts(deleted, pinned, bot_generated, source_msg_id);
-"""
-
-SNIPPET_LEN = 80
+# ========= DB =========
+init_db(DB_FILE)
+logger.info(f"SQLite listo. BORRADOR={SOURCE_CHAT_ID}  PRINCIPAL={TARGET_CHAT_ID}  TZ={TZNAME}  PAUSE={PAUSE}s")
 
 
-async def db_init():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.executescript(CREATE_SQL)
-        await db.commit()
+# -------------------------------------------------------
+# helpers
+# -------------------------------------------------------
+def _poll_payload_from_raw(raw: dict) -> Tuple[dict, bool]:
+    """
+    Extrae un payload listo para send_poll a partir de raw['poll'].
+    Devuelve (kwargs, is_quiz).
+    """
+    p = raw.get("poll") or {}
+    question = p.get("question", "Pregunta")
+    options  = [o.get("text", "") for o in p.get("options", [])]
+    is_anon  = p.get("is_anonymous", True)
+    allows_multiple = p.get("allows_multiple_answers", False)
+    ptype = p.get("type", "regular")
+    is_quiz = (ptype == "quiz")
+
+    kwargs = dict(
+        chat_id=TARGET_CHAT_ID,
+        question=question,
+        options=options,
+        is_anonymous=is_anon,
+        allows_multiple_answers=allows_multiple
+    )
+
+    # Quiz: respuesta correcta
+    if is_quiz and p.get("correct_option_id") is not None:
+        kwargs["type"] = "quiz"
+        kwargs["correct_option_id"] = int(p["correct_option_id"])
+
+    # Tiempos (si existieran)
+    if p.get("open_period") is not None:
+        try: kwargs["open_period"] = int(p["open_period"])
+        except Exception: pass
+    if p.get("close_date") is not None:
+        try: kwargs["close_date"] = int(p["close_date"])
+        except Exception: pass
+
+    # Explicación (solo quiz)
+    if is_quiz and p.get("explanation"):
+        kwargs["explanation"] = str(p["explanation"])
+
+    return kwargs, is_quiz
 
 
-async def db_insert_draft(
-    chat_id: int,
-    source_msg_id: int,
-    kind: str,
-    text_snippet: Optional[str],
-    poll_question: Optional[str],
-    poll_options: Optional[str],
-    pinned: int,
-    bot_generated: int,
-):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """
-            INSERT OR IGNORE INTO drafts
-            (chat_id, source_msg_id, kind, text_snippet, poll_question, poll_options, deleted, pinned, bot_generated, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, strftime('%s','now'))
-            """,
-            (
-                chat_id,
-                source_msg_id,
-                kind,
-                text_snippet,
-                poll_question,
-                poll_options,
-                pinned,
-                bot_generated,
-            ),
-        )
-        await db.commit()
+async def _safe_sleep(seconds: float):
+    try:
+        await asyncio.sleep(max(0.0, seconds))
+    except Exception:
+        pass
 
 
-async def db_list_drafts() -> List[Tuple[int, str, str, str]]:
-    """(msg_id, kind, snippet, poll_question) solo activos (no /eliminar, no pinned, no bot)."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            """
-            SELECT source_msg_id, kind, COALESCE(text_snippet,''), COALESCE(poll_question,'')
-            FROM drafts
-            WHERE deleted=0 AND pinned=0 AND bot_generated=0
-            ORDER BY source_msg_id ASC
-            """
-        )
-        return await cur.fetchall()
+async def _send_with_backoff(send_coro_func, *, base_pause: float) -> bool:
+    """
+    Ejecuta la corrutina de envío con control de flood y reintentos.
+    Devuelve True si se envió; False si definitivamente falló.
+    """
+    tries = 0
+    while True:
+        try:
+            await send_coro_func()
+            await _safe_sleep(base_pause)
+            return True
+        except RetryAfter as e:
+            wait = getattr(e, "retry_after", None)
+            if wait is None:
+                m = re.search(r"Retry in (\d+)", str(e))
+                wait = int(m.group(1)) if m else 3
+            logger.warning(f"RetryAfter: esperando {wait}s …")
+            await _safe_sleep(wait + 1.0)
+            tries += 1
+        except TimedOut:
+            logger.warning("TimedOut: esperando 3s …")
+            await _safe_sleep(3.0)
+            tries += 1
+        except NetworkError:
+            logger.warning("NetworkError: esperando 3s …")
+            await _safe_sleep(3.0)
+            tries += 1
+        except TelegramError as e:
+            if "Flood control exceeded" in str(e):
+                m = re.search(r"Retry in (\d+)", str(e))
+                wait = int(m.group(1)) if m else 5
+                logger.warning(f"Flood control: esperando {wait}s …")
+                await _safe_sleep(wait + 1.0)
+                tries += 1
+            else:
+                logger.error(f"TelegramError no recuperable: {e}")
+                return False
+        except Exception as e:
+            logger.exception(f"Error enviando: {e}")
+            return False
+
+        if tries >= 5:
+            logger.error("Demasiados reintentos; abandono este mensaje.")
+            return False
 
 
-async def db_counts_for_report() -> Tuple[int, int, int]:
-    """Devuelve (activos, eliminados, total_para_reporte = activos + eliminados)."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            """
-            SELECT
-              SUM(CASE WHEN deleted=0 AND pinned=0 AND bot_generated=0 THEN 1 ELSE 0 END) AS activos,
-              SUM(CASE WHEN deleted=1 AND pinned=0 AND bot_generated=0 THEN 1 ELSE 0 END) AS eliminados
-            FROM drafts
-            """
-        )
-        row = await cur.fetchone()
-        activos = int(row[0] or 0)
-        eliminados = int(row[1] or 0)
-        return activos, eliminados, activos + eliminados
-
-
-async def db_mark_deleted(source_msg_id: int, deleted: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "UPDATE drafts SET deleted=? WHERE source_msg_id=?",
-            (1 if deleted else 0, source_msg_id),
-        )
-        await db.commit()
-        return cur.rowcount > 0
-
-
-async def db_get_draft(source_msg_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            """
-            SELECT chat_id, source_msg_id, kind, text_snippet, poll_question, poll_options, deleted
-            FROM drafts WHERE source_msg_id=?
-            """,
-            (source_msg_id,),
-        )
-        return await cur.fetchone()
-
-
-async def db_all_active_to_publish() -> List[Tuple[int, str, Optional[str], Optional[str]]]:
-    """(source_msg_id, kind, poll_question, poll_options) activos para publicar."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            """
-            SELECT source_msg_id, kind, poll_question, poll_options
-            FROM drafts
-            WHERE deleted=0 AND pinned=0 AND bot_generated=0
-            ORDER BY source_msg_id ASC
-            """
-        )
-        return await cur.fetchall()
-
-
-# -------------------------
-# Utils
-# -------------------------
-def is_command_message_text(text: Optional[str]) -> bool:
-    if not text:
-        return False
-    t = text.strip()
-    return t.startswith("/")
-
-
-def make_snippet(text: Optional[str]) -> Optional[str]:
-    if not text:
-        return None
-    t = " ".join(text.strip().split())
-    return t[:SNIPPET_LEN] + ("…" if len(t) > SNIPPET_LEN else "")
-
-
-def build_channel_link(chat_id: int, message_id: int) -> Optional[str]:
+def _build_channel_link(chat_id: int, message_id: int) -> Optional[str]:
     s = str(chat_id)
     if s.startswith("-100"):
-        short = s[4:]
-        return f"https://t.me/c/{short}/{message_id}"
+        return f"https://t.me/c/{s[4:]}/{message_id}"
     return None
 
 
-async def gentle_pause():
-    # Pausa pseudo-aleatoria alrededor de PAUSE_SEC
-    base = max(0.2, PAUSE_SEC)
-    extra = random.uniform(-0.2, 0.3)
-    await asyncio.sleep(base + extra)
+# -------------------------------------------------------
+# Publicar todos los borradores pendientes en orden
+# -------------------------------------------------------
+async def _publicar_todo(context: ContextTypes.DEFAULT_TYPE) -> Tuple[int, int]:
+    rows = get_unsent_drafts(DB_FILE)  # [(message_id, text, raw_json)]
+    if not rows:
+        return 0, 0
+
+    publicados, fallidos = 0, 0
+    enviados_ids = []
+
+    for mid, _t, raw in rows:
+        try:
+            data = json.loads(raw or "{}")
+        except Exception:
+            data = {}
+
+        ok = False
+        # ---- Encuesta: RECONSTRUIR ----
+        if "poll" in data:
+            kwargs, _is_quiz = _poll_payload_from_raw(data)
+
+            async def _do():
+                await context.bot.send_poll(**kwargs)
+
+            ok = await _send_with_backoff(_do, base_pause=PAUSE)
+
+        # ---- Resto: copiar tal cual ----
+        else:
+            async def _do():
+                await context.bot.copy_message(
+                    chat_id=TARGET_CHAT_ID,
+                    from_chat_id=SOURCE_CHAT_ID,
+                    message_id=mid
+                )
+            ok = await _send_with_backoff(_do, base_pause=PAUSE)
+
+        if ok:
+            publicados += 1
+            enviados_ids.append(mid)
+        else:
+            fallidos += 1
+
+    if enviados_ids:
+        mark_sent(DB_FILE, enviados_ids)
+    return publicados, fallidos
 
 
-# -------------------------
-# Handlers
-# -------------------------
+# -------------------------------------------------------
+# Utilidades de comandos
+# -------------------------------------------------------
+def _extract_id_from_text(txt: str) -> Optional[int]:
+    parts = (txt or "").split()
+    for p in parts[1:]:
+        if p.isdigit():
+            return int(p)
+        if p.lower().startswith("id:"):
+            n = p.split(":", 1)[1]
+            if n.isdigit():
+                return int(n)
+    return None
+
+def _is_command_text(txt: Optional[str]) -> bool:
+    return bool(txt and txt.strip().startswith("/"))
+
+
+async def _cmd_listar(context: ContextTypes.DEFAULT_TYPE):
+    drafts = list_drafts(DB_FILE)  # [(id, text)]
+    if not drafts:
+        await context.bot.send_message(SOURCE_CHAT_ID, "📁 No hay borradores.")
+        return
+    out = ["🗒️ Borradores pendientes:"]
+    for i, (did, snip) in enumerate(drafts, start=1):
+        s = (snip or "").strip()
+        if len(s) > 60:
+            s = s[:60] + "…"
+        out.append(f"• {i:>2} — {s or '[contenido]'}  (id:{did})")
+    await context.bot.send_message(SOURCE_CHAT_ID, "\n".join(out))
+
+
+async def _cmd_eliminar(update: Update, context: ContextTypes.DEFAULT_TYPE, txt: str):
+    mid = _extract_id_from_text(txt)
+    if not mid and update.channel_post and update.channel_post.reply_to_message:
+        mid = update.channel_post.reply_to_message.message_id
+
+    if not mid:
+        await context.bot.send_message(SOURCE_CHAT_ID, "❌ Usa: /eliminar <id> o responde al mensaje a eliminar.")
+        return
+
+    mark_deleted(DB_FILE, mid)
+    restantes = len(list_drafts(DB_FILE))
+    await context.bot.send_message(SOURCE_CHAT_ID, f"🗑️ Eliminado id:{mid}. Quedan {restantes} en la cola.")
+
+
+async def _cmd_deshacer(update: Update, context: ContextTypes.DEFAULT_TYPE, txt: str):
+    mid = _extract_id_from_text(txt)
+    if not mid and update.channel_post and update.channel_post.reply_to_message:
+        mid = update.channel_post.reply_to_message.message_id
+    if not mid:
+        mid = get_last_deleted(DB_FILE)
+
+    if not mid:
+        await context.bot.send_message(SOURCE_CHAT_ID, "ℹ️ No hay nada para deshacer.")
+        return
+
+    restore_draft(DB_FILE, mid)
+    restantes = len(list_drafts(DB_FILE))
+    await context.bot.send_message(SOURCE_CHAT_ID, f"↩️ Restaurado id:{mid}. Ahora hay {restantes} en la cola.")
+
+
+async def _cmd_programar(context: ContextTypes.DEFAULT_TYPE, when_str: str):
+    try:
+        when = datetime.strptime(when_str, "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+    except Exception:
+        await context.bot.send_message(SOURCE_CHAT_ID, "❌ Formato inválido. Ej: /programar 2025-08-20 07:00")
+        return
+
+    now = datetime.now(tz=TZ)
+    seconds = max(0, int((when - now).total_seconds()))
+
+    if not context.job_queue:
+        await context.bot.send_message(
+            SOURCE_CHAT_ID,
+            "❌ No pude programar. Falta JobQueue. Asegúrate de usar "
+            "`python-telegram-bot[job-queue]` en requirements.txt",
+            parse_mode="Markdown"
+        )
+        return
+
+    async def job(ctx: ContextTypes.DEFAULT_TYPE):
+        ok, fail = await _publicar_todo(ctx)
+        deleted = count_deleted_unsent(DB_FILE)
+        total = ok + fail + deleted
+        msg2 = f"⏱️ Programación ejecutada. Publicados {ok}.\n📦 Resultado: {ok}/{total} enviados."
+        if deleted:
+            msg2 += f" 🗑️ Omitidos por /eliminar: {deleted}."
+        if fail:
+            msg2 += " ⚠️ Revisa permisos y flood control."
+        await ctx.bot.send_message(SOURCE_CHAT_ID, msg2)
+
+    context.job_queue.run_once(lambda ctx: asyncio.create_task(job(ctx)), when=seconds)
+    await context.bot.send_message(SOURCE_CHAT_ID, f"🗓️ Programado para {when.astimezone(TZ):%Y-%m-%d %H:%M} ({TZNAME}).")
+
+
+async def _cmd_mensaje(context: ContextTypes.DEFAULT_TYPE, txt: str):
+    mid = _extract_id_from_text(txt)
+    if not mid:
+        await context.bot.send_message(SOURCE_CHAT_ID, "Usa: /mensaje <id>")
+        return
+
+    snippet = get_draft_snippet(DB_FILE, mid) or "[contenido]"
+    link = _build_channel_link(SOURCE_CHAT_ID, mid)
+    preview = f"*id:{mid}*\n{snippet}"
+    if link:
+        preview += f"\n\n[Ver en borrador]({link})"
+
+    try:
+        await context.bot.send_message(
+            SOURCE_CHAT_ID,
+            preview,
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+            reply_to_message_id=mid  # “señala” el mensaje
+        )
+    except BadRequest:
+        # si no se puede responder (p. ej. no existe), envía sin reply
+        await context.bot.send_message(
+            SOURCE_CHAT_ID,
+            preview,
+            parse_mode="Markdown",
+            disable_web_page_preview=True
+        )
+
+
+# -------------------------------------------------------
+# Handler único de POSTS en el CANAL BORRADOR
+# -------------------------------------------------------
 async def handle_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Guarda borradores cuando llegan al canal BORRADOR."""
     msg = update.channel_post
     if not msg or msg.chat_id != SOURCE_CHAT_ID:
         return
 
-    # 1) Ignorar mensajes de servicio (pinned, joins, etc.)
+    # Ignorar mensajes de servicio (pinned, joins, etc.)
     if msg.pinned_message or msg.new_chat_members or msg.left_chat_member:
         return
 
-    # 2) Ignorar comandos / mensajes que empiezan con "/"
-    if is_command_message_text(msg.text) or is_command_message_text(getattr(msg, "caption", None)):
+    # Ignorar mensajes del propio bot
+    if msg.from_user and msg.from_user.is_bot:
         return
 
-    # 3) Ignorar mensajes generados por el bot
-    bot_generated = 1 if (msg.from_user and msg.from_user.is_bot) else 0
-    if bot_generated:
-        return
+    txt_or_caption = (msg.text or msg.caption or "").strip()
 
-    # 4) Detectar tipo y extraer info
-    kind = "text"
-    snippet = None
-    poll_q = None
-    poll_opts = None
+    # --------- COMANDOS (NO SE GUARDAN COMO BORRADOR) ----------
+    if _is_command_text(txt_or_caption):
+        low = txt_or_caption.lower()
 
-    if msg.poll:
-        kind = "poll"
-        poll: Poll = msg.poll
-        poll_q = poll.question
-        poll_opts = "\n".join([o.text for o in poll.options])
-        snippet = make_snippet(poll_q)
-    elif msg.text:
-        kind = "text"
-        snippet = make_snippet(msg.text)
-    else:
-        kind = "media"
-        snippet = make_snippet(getattr(msg, "caption", None))
+        if low.startswith(("/listar", "/lista")):
+            await _cmd_listar(context);  return
 
-    await db_insert_draft(
-        chat_id=msg.chat_id,
-        source_msg_id=msg.message_id,
-        kind=kind,
-        text_snippet=snippet,
-        poll_question=poll_q,
-        poll_options=poll_opts,
-        pinned=0,
-        bot_generated=0,
-    )
-    log.info("Guardado en borrador: %s", msg.message_id)
+        if low.startswith(("/eliminar", "/borrar", "/remover", "/delete", "/remove")):
+            await _cmd_eliminar(update, context, txt_or_caption);  return
 
+        if low.startswith(("/deshacer", "/undo", "/restaurar")):
+            await _cmd_deshacer(update, context, txt_or_caption);  return
 
-async def cmd_comandos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != SOURCE_CHAT_ID:
-        return
-    text = (
-        "🛠️ *Comandos:*\n"
-        "• */listar* — muestra borradores pendientes\n"
-        "• */eliminar* `<id>` — o responde con */eliminar* al mensaje\n"
-        "• */deshacer* `<id>` — revierte un */eliminar* (o responde)\n"
-        "• */enviar* — publica ahora\n"
-        "• */programar* `YYYY-MM-DD HH:MM` — programa el envío\n"
-        "• */mensaje* `<id>` — vista previa/enlace del borrador\n"
-        "• */id* — responde a un mensaje para ver su id\n"
-        "• */comandos* — muestra esta ayuda\n"
-    )
-    await update.effective_message.reply_text(
-        text,
-        parse_mode=constants.ParseMode.MARKDOWN,
-        disable_web_page_preview=True,
-    )
+        if low.startswith("/enviar"):
+            ok, fail = await _publicar_todo(context)
+            deleted = count_deleted_unsent(DB_FILE)
+            total = ok + fail + deleted
+            msg_out = (
+                f"✅ Publicados {ok}.\n"
+                f"📦 Resultado: {ok}/{total} enviados."
+            )
+            if deleted:
+                msg_out += f" 🗑️ Omitidos por /eliminar: {deleted}."
+            if fail:
+                msg_out += " ⚠️ Revisa permisos y flood control."
+            await context.bot.send_message(SOURCE_CHAT_ID, msg_out)
+            return
 
-
-async def cmd_listar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != SOURCE_CHAT_ID:
-        return
-    drafts = await db_list_drafts()
-    if not drafts:
-        await update.effective_message.reply_text("📁 No hay borradores.")
-        return
-
-    lines = ["🗒️ *Borradores pendientes:*"]
-    for i, (mid, kind, snip, pq) in enumerate(drafts, start=1):
-        label = snip or pq or "[contenido]"
-        if kind == "poll":
-            label = f"[encuesta] {pq or ''}".strip()
-        lines.append(f"• {i} — {label}  (id:{mid})")
-
-    await update.effective_message.reply_text(
-        "\n".join(lines),
-        parse_mode=constants.ParseMode.MARKDOWN,
-        disable_web_page_preview=True,
-    )
-
-
-async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != SOURCE_CHAT_ID:
-        return
-    ref = update.effective_message.reply_to_message
-    if not ref:
-        await update.effective_message.reply_text("Responde a un mensaje del canal con /id.")
-        return
-    await update.effective_message.reply_text(f"id:{ref.message_id}")
-
-
-def _parse_single_id(update: Update, args: List[str]) -> Optional[int]:
-    if args:
-        raw = args[0].replace("id:", "").strip()
-        if raw.isdigit():
-            return int(raw)
-    ref = update.effective_message.reply_to_message
-    if ref:
-        return ref.message_id
-    return None
-
-
-async def cmd_eliminar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != SOURCE_CHAT_ID:
-        return
-    mid = _parse_single_id(update, context.args)
-    if not mid:
-        await update.effective_message.reply_text("Usa /eliminar <id> o responde con /eliminar al mensaje.")
-        return
-    ok = await db_mark_deleted(mid, True)
-    if not ok:
-        await update.effective_message.reply_text(f"No encontré el id:{mid}.")
-        return
-    rest = len(await db_list_drafts())
-    await update.effective_message.reply_text(f"🗑️ Eliminado id:{mid}. Quedan {rest} en la cola.")
-
-
-async def cmd_deshacer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != SOURCE_CHAT_ID:
-        return
-    mid = _parse_single_id(update, context.args)
-    if not mid:
-        await update.effective_message.reply_text("Usa /deshacer <id> o responde con /deshacer al mensaje.")
-        return
-    ok = await db_mark_deleted(mid, False)
-    if not ok:
-        await update.effective_message.reply_text(f"No encontré el id:{mid}.")
-        return
-    rest = len(await db_list_drafts())
-    await update.effective_message.reply_text(f"↩️ Repuesto id:{mid}. Quedan {rest} en la cola.")
-
-
-async def cmd_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != SOURCE_CHAT_ID:
-        return
-    if not context.args:
-        await update.effective_message.reply_text("Usa: /mensaje <id>")
-        return
-    try:
-        mid = int(context.args[0].replace("id:", "").strip())
-    except ValueError:
-        await update.effective_message.reply_text("Formato: /mensaje <id>")
-        return
-
-    row = await db_get_draft(mid)
-    if not row:
-        await update.effective_message.reply_text(f"No encontré el id:{mid}.")
-        return
-
-    _, source_msg_id, kind, snippet, pq, _opts, _del = row
-    label = snippet or pq or "[contenido]"
-    link = build_channel_link(SOURCE_CHAT_ID, source_msg_id)
-    text = f"*id:{source_msg_id}* [{kind}]\n{label}"
-    if link:
-        text += f"\n\n[Ver en borrador]({link})"
-    await update.effective_message.reply_text(
-        text,
-        parse_mode=constants.ParseMode.MARKDOWN,
-        disable_web_page_preview=True,
-    )
-
-
-async def publish_all(context: ContextTypes.DEFAULT_TYPE) -> Tuple[int, int, int, int]:
-    """Devuelve (total_reportado, enviados, eliminados_manuales, fallidos)."""
-    activos, eliminados, total_report = await db_counts_for_report()
-    drafts = await db_all_active_to_publish()
-
-    enviados = 0
-    fallidos = 0
-    bot = context.bot
-
-    for (source_msg_id, kind, poll_question, poll_options) in drafts:
-        try:
-            if kind == "poll":
-                options = (poll_options or "").split("\n") if poll_options else []
-                if not options or not poll_question:
-                    raise BadRequest("Poll malformada")
-                await bot.send_poll(
-                    chat_id=TARGET_CHAT_ID,
-                    question=poll_question,
-                    options=options,
-                    is_anonymous=True,
-                    allows_multiple_answers=False,
-                )
+        if low.startswith("/programar"):
+            parts = txt_or_caption.split(maxsplit=2)
+            if len(parts) >= 3:
+                when_str = f"{parts[1]} {parts[2]}"
+                await _cmd_programar(context, when_str)
             else:
-                await bot.copy_message(
-                    chat_id=TARGET_CHAT_ID,
-                    from_chat_id=SOURCE_CHAT_ID,
-                    message_id=source_msg_id,
-                )
+                await context.bot.send_message(SOURCE_CHAT_ID, "Usa: /programar YYYY-MM-DD HH:MM")
+            return
 
-            enviados += 1
-            await gentle_pause()
+        if low.startswith("/mensaje"):
+            await _cmd_mensaje(context, txt_or_caption)
+            return
 
-        except RetryAfter as e:
-            wait = int(getattr(e, "retry_after", 3)) + 1
-            log.warning("RetryAfter %ss (flood control). Esperando…", wait)
-            await asyncio.sleep(wait)
-            try:
-                if kind == "poll":
-                    options = (poll_options or "").split("\n") if poll_options else []
-                    await bot.send_poll(
-                        chat_id=TARGET_CHAT_ID,
-                        question=poll_question or "",
-                        options=options,
-                        is_anonymous=True,
-                        allows_multiple_answers=False,
-                    )
-                else:
-                    await bot.copy_message(
-                        chat_id=TARGET_CHAT_ID,
-                        from_chat_id=SOURCE_CHAT_ID,
-                        message_id=source_msg_id,
-                    )
-                enviados += 1
-            except Exception as e2:
-                log.error("Falló tras RetryAfter id:%s -> %s", source_msg_id, e2)
-                fallidos += 1
+        if low.startswith("/id"):
+            await context.bot.send_message(
+                SOURCE_CHAT_ID,
+                f"BORRADOR: `{SOURCE_CHAT_ID}`\nPRINCIPAL: `{TARGET_CHAT_ID}`",
+                parse_mode="Markdown"
+            )
+            return
 
-        except (TimedOut, NetworkError):
-            ok = False
-            for _ in range(3):
-                await asyncio.sleep(3)
-                try:
-                    if kind == "poll":
-                        options = (poll_options or "").split("\n") if poll_options else []
-                        await bot.send_poll(
-                            chat_id=TARGET_CHAT_ID,
-                            question=poll_question or "",
-                            options=options,
-                            is_anonymous=True,
-                            allows_multiple_answers=False,
-                        )
-                    else:
-                        await bot.copy_message(
-                            chat_id=TARGET_CHAT_ID,
-                            from_chat_id=SOURCE_CHAT_ID,
-                            message_id=source_msg_id,
-                        )
-                    enviados += 1
-                    ok = True
-                    break
-                except Exception:
-                    pass
-            if not ok:
-                log.error("Demasiados reintentos; abandono id:%s", source_msg_id)
-                fallidos += 1
+        if low.startswith(("/comandos", "/ayuda", "/start")):
+            await context.bot.send_message(
+                SOURCE_CHAT_ID,
+                "🛠️ Comandos:\n"
+                "• /listar — muestra borradores pendientes\n"
+                "• /eliminar <id> — o responde con /eliminar al mensaje\n"
+                "• /deshacer [id] — revierte un /eliminar (o responde)\n"
+                "• /mensaje <id> — vista previa/enlace al borrador\n"
+                "• /enviar — publica ahora\n"
+                "• /programar YYYY-MM-DD HH:MM — programa el envío\n"
+                "• /id — muestra IDs\n"
+                "• /comandos — esta ayuda\n"
+            )
+            return
 
-        except (BadRequest, Forbidden) as e:
-            log.error("No pude publicar id:%s -> %s", source_msg_id, e)
-            fallidos += 1
-
-    return (total_report, enviados, eliminados, fallidos)
-
-
-async def cmd_enviar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != SOURCE_CHAT_ID:
-        return
-    total, enviados, eliminados, fallidos = await publish_all(context)
-    texto = (
-        f"✅ Publicados {enviados}.\n"
-        f"📦 Resultado: {enviados}/{total} enviados."
-    )
-    if eliminados:
-        texto += f" 🗑️ Omitidos por /eliminar: {eliminados}."
-    if fallidos:
-        texto += " ⚠️ Revisa permisos y flood control."
-    await update.effective_message.reply_text(texto)
-
-
-async def cmd_programar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != SOURCE_CHAT_ID:
-        return
-    if len(context.args) < 2:
-        await update.effective_message.reply_text("Usa: /programar YYYY-MM-DD HH:MM")
-        return
-    when_str = f"{context.args[0]} {context.args[1]}"
-    try:
-        dt = datetime.strptime(when_str, "%Y-%m-%d %H:%M").replace(tzinfo=LOCAL_TZ)
-    except ValueError:
-        await update.effective_message.reply_text("❌ Formato inválido. Ej: /programar 2025-08-20 07:00")
+        # Comando desconocido: simplemente avisa
+        await context.bot.send_message(SOURCE_CHAT_ID, "Comando no reconocido. Usa /comandos.")
         return
 
-    now = datetime.now(tz=LOCAL_TZ)
-    diff = (dt - now).total_seconds()
-    if diff <= 0:
-        await update.effective_message.reply_text("La fecha/hora ya pasó.")
-        return
-
-    async def job(_context: ContextTypes.DEFAULT_TYPE):
-        await publish_all(_context)
-
-    context.job_queue.run_once(job, when=diff)
-    await update.effective_message.reply_text(f"🗓️ Programado para {dt.strftime('%Y-%m-%d %H:%M')} ({TZ_NAME}).")
+    # --------- SI NO ES COMANDO → GUARDAR BORRADOR ----------
+    # snippet: usa texto o caption; si queda vacío, igual guardamos (imágenes/documentos)
+    snippet = msg.text or msg.caption or ""
+    raw_json = json.dumps(msg.to_dict(), ensure_ascii=False)
+    save_draft(DB_FILE, msg.message_id, snippet, raw_json)
+    logger.info(f"Guardado en borrador: {msg.message_id}")
 
 
-# -------------------------
-# App bootstrap
-# -------------------------
+# ========= ERROR HANDLER =========
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Excepción no capturada", exc_info=context.error)
+
+
+# ========= MAIN =========
 def main():
-    asyncio.run(db_init())
-
-    app: Application = (
-        ApplicationBuilder()
+    app = (
+        Application.builder()
         .token(BOT_TOKEN)
-        .rate_limiter(AIORateLimiter(max_retries=0))
         .build()
     )
 
-    # Comandos
-    app.add_handler(CommandHandler("comandos", cmd_comandos, filters.Chat(SOURCE_CHAT_ID)))
-    app.add_handler(CommandHandler("listar", cmd_listar, filters.Chat(SOURCE_CHAT_ID)))
-    app.add_handler(CommandHandler("id", cmd_id, filters.Chat(SOURCE_CHAT_ID)))
-    app.add_handler(CommandHandler("eliminar", cmd_eliminar, filters.Chat(SOURCE_CHAT_ID)))
-    app.add_handler(CommandHandler("deshacer", cmd_deshacer, filters.Chat(SOURCE_CHAT_ID)))
-    app.add_handler(CommandHandler("mensaje", cmd_mensaje, filters.Chat(SOURCE_CHAT_ID)))
-    app.add_handler(CommandHandler("enviar", cmd_enviar, filters.Chat(SOURCE_CHAT_ID)))
-    app.add_handler(CommandHandler("programar", cmd_programar, filters.Chat(SOURCE_CHAT_ID)))
-
-    # Escuchar publicaciones del canal BORRADOR
+    # En canales se usa MessageHandler con ChatType.CHANNEL
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel))
 
-    log.info("SQLite listo. BORRADOR=%s  PUBLICACIÓN=%s  TZ=%s  PAUSE=%.3fs", SOURCE_CHAT_ID, TARGET_CHAT_ID, TZ_NAME, PAUSE_SEC)
-    app.run_polling(allowed_updates=["channel_post", "message"], drop_pending_updates=True)
+    # Registrar error handler
+    app.add_error_handler(on_error)
+
+    logger.info("Bot iniciado 🚀 Escuchando channel_post en el BORRADOR.")
+    app.run_polling(allowed_updates=["channel_post"], drop_pending_updates=True)
 
 
 if __name__ == "__main__":
