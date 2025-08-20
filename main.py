@@ -30,7 +30,7 @@ from zoneinfo import ZoneInfo
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
 from telegram.error import (
-    TelegramError, Forbidden, BadRequest, RetryAfter, TimedOut, NetworkError
+    TelegramError, BadRequest, RetryAfter, TimedOut, NetworkError
 )
 
 from database import (
@@ -294,8 +294,8 @@ async def _cmd_programar(context: ContextTypes.DEFAULT_TYPE, when_str: str):
         return
 
     async def job(ctx: ContextTypes.DEFAULT_TYPE):
+        deleted = count_deleted_unsent(DB_FILE)  # omitidos por /eliminar
         ok, fail = await _publicar_todo(ctx)
-        deleted = count_deleted_unsent(DB_FILE)
         total = ok + fail + deleted
         msg2 = f"⏱️ Programación ejecutada. Publicados {ok}.\n📦 Resultado: {ok}/{total} enviados."
         if deleted:
@@ -329,7 +329,6 @@ async def _cmd_mensaje(context: ContextTypes.DEFAULT_TYPE, txt: str):
             reply_to_message_id=mid  # “señala” el mensaje
         )
     except BadRequest:
-        # si no se puede responder (p. ej. no existe), envía sin reply
         await context.bot.send_message(
             SOURCE_CHAT_ID,
             preview,
@@ -370,8 +369,8 @@ async def handle_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _cmd_deshacer(update, context, txt_or_caption);  return
 
         if low.startswith("/enviar"):
-            ok, fail = await _publicar_todo(context)
             deleted = count_deleted_unsent(DB_FILE)
+            ok, fail = await _publicar_todo(context)
             total = ok + fail + deleted
             msg_out = (
                 f"✅ Publicados {ok}.\n"
@@ -420,12 +419,10 @@ async def handle_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Comando desconocido: simplemente avisa
         await context.bot.send_message(SOURCE_CHAT_ID, "Comando no reconocido. Usa /comandos.")
         return
 
     # --------- SI NO ES COMANDO → GUARDAR BORRADOR ----------
-    # snippet: usa texto o caption; si queda vacío, igual guardamos (imágenes/documentos)
     snippet = msg.text or msg.caption or ""
     raw_json = json.dumps(msg.to_dict(), ensure_ascii=False)
     save_draft(DB_FILE, msg.message_id, snippet, raw_json)
@@ -445,10 +442,7 @@ def main():
         .build()
     )
 
-    # En canales se usa MessageHandler con ChatType.CHANNEL
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel))
-
-    # Registrar error handler
     app.add_error_handler(on_error)
 
     logger.info("Bot iniciado 🚀 Escuchando channel_post en el BORRADOR.")
