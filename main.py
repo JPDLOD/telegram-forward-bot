@@ -8,14 +8,12 @@
 #   /listar
 #   /eliminar <id>  (alias: /borrar, /remover, /delete) o responder con el comando
 #   /deshacer [id]  (alias: /undo, /restaurar) o responder con el comando
-#   /mensaje <id>   — señala/da link a ese borrador
 #   /enviar
 #   /programar YYYY-MM-DD HH:MM
 #   /id
 #   /comandos  (alias: /ayuda, /start)
 #
 # NOTA: Los mensajes que empiecen por "/" NO se guardan como borradores.
-#       También se ignoran mensajes fijados (pinned/service) y mensajes del propio bot.
 
 import os
 import re
@@ -30,12 +28,12 @@ from zoneinfo import ZoneInfo
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
 from telegram.error import (
-    TelegramError, BadRequest, RetryAfter, TimedOut, NetworkError
+    TelegramError, Forbidden, BadRequest, RetryAfter, TimedOut, NetworkError
 )
 
 from database import (
     init_db, save_draft, get_unsent_drafts, mark_sent, list_drafts,
-    mark_deleted, restore_draft, get_last_deleted, count_deleted_unsent, get_draft_snippet
+    mark_deleted, restore_draft, get_last_deleted
 )
 
 # =========================
@@ -69,10 +67,17 @@ def _poll_payload_from_raw(raw: dict) -> Tuple[dict, bool]:
     Devuelve (kwargs, is_quiz).
     """
     p = raw.get("poll") or {}
-    question = p.get("question", "Pregunta")
-    options  = [o.get("text", "") for o in p.get("options", [])]
-    is_anon  = p.get("is_anonymous", True)
-    allows_multiple = p.get("allows_multiple_answers", False)
+    question = str(p.get("question", "Pregunta"))
+
+    # Asegurar lista de strings (2–10 opciones)
+    options = [str(o.get("text", "")).strip() for o in p.get("options", []) if (o.get("text") is not None)]
+    options = [opt for opt in options if opt]
+    if len(options) < 2:
+        options = options + ["Opción 1", "Opción 2"]
+    if len(options) > 10:
+        options = options[:10]
+
+    is_anon = bool(p.get("is_anonymous", True))
     ptype = p.get("type", "regular")
     is_quiz = (ptype == "quiz")
 
@@ -81,25 +86,30 @@ def _poll_payload_from_raw(raw: dict) -> Tuple[dict, bool]:
         question=question,
         options=options,
         is_anonymous=is_anon,
-        allows_multiple_answers=allows_multiple
     )
 
-    # Quiz: respuesta correcta
-    if is_quiz and p.get("correct_option_id") is not None:
+    if is_quiz:
+        # Forzar quiz y conservar correct_option_id incluso si es 0
         kwargs["type"] = "quiz"
-        kwargs["correct_option_id"] = int(p["correct_option_id"])
+        if "correct_option_id" in p and p.get("correct_option_id") is not None:
+            try:
+                kwargs["correct_option_id"] = int(p["correct_option_id"])
+            except Exception:
+                pass
+        if p.get("explanation"):
+            kwargs["explanation"] = str(p["explanation"])
+        # Importante: NO mandar allows_multiple_answers en quiz
+    else:
+        # Solo en encuestas regulares
+        kwargs["allows_multiple_answers"] = bool(p.get("allows_multiple_answers", False))
 
-    # Tiempos (si existieran)
+    # Ventanas de tiempo (opcionales)
     if p.get("open_period") is not None:
         try: kwargs["open_period"] = int(p["open_period"])
         except Exception: pass
     if p.get("close_date") is not None:
         try: kwargs["close_date"] = int(p["close_date"])
         except Exception: pass
-
-    # Explicación (solo quiz)
-    if is_quiz and p.get("explanation"):
-        kwargs["explanation"] = str(p["explanation"])
 
     return kwargs, is_quiz
 
@@ -125,6 +135,7 @@ async def _send_with_backoff(send_coro_func, *, base_pause: float) -> bool:
         except RetryAfter as e:
             wait = getattr(e, "retry_after", None)
             if wait is None:
+                # Mensaje de texto tipo "Retry in X seconds"
                 m = re.search(r"Retry in (\d+)", str(e))
                 wait = int(m.group(1)) if m else 3
             logger.warning(f"RetryAfter: esperando {wait}s …")
@@ -139,6 +150,7 @@ async def _send_with_backoff(send_coro_func, *, base_pause: float) -> bool:
             await _safe_sleep(3.0)
             tries += 1
         except TelegramError as e:
+            # Flood genérico
             if "Flood control exceeded" in str(e):
                 m = re.search(r"Retry in (\d+)", str(e))
                 wait = int(m.group(1)) if m else 5
@@ -155,13 +167,6 @@ async def _send_with_backoff(send_coro_func, *, base_pause: float) -> bool:
         if tries >= 5:
             logger.error("Demasiados reintentos; abandono este mensaje.")
             return False
-
-
-def _build_channel_link(chat_id: int, message_id: int) -> Optional[str]:
-    s = str(chat_id)
-    if s.startswith("-100"):
-        return f"https://t.me/c/{s[4:]}/{message_id}"
-    return None
 
 
 # -------------------------------------------------------
@@ -187,7 +192,12 @@ async def _publicar_todo(context: ContextTypes.DEFAULT_TYPE) -> Tuple[int, int]:
             kwargs, _is_quiz = _poll_payload_from_raw(data)
 
             async def _do():
-                await context.bot.send_poll(**kwargs)
+                try:
+                    await context.bot.send_poll(**kwargs)
+                except BadRequest as e:
+                    # Si Telegram rechaza, deja registro visible
+                    await context.bot.send_message(SOURCE_CHAT_ID, f"❌ No pude enviar la encuesta id:{mid}: {e.message}")
+                    raise
 
             ok = await _send_with_backoff(_do, base_pause=PAUSE)
 
@@ -226,16 +236,13 @@ def _extract_id_from_text(txt: str) -> Optional[int]:
                 return int(n)
     return None
 
-def _is_command_text(txt: Optional[str]) -> bool:
-    return bool(txt and txt.strip().startswith("/"))
-
 
 async def _cmd_listar(context: ContextTypes.DEFAULT_TYPE):
     drafts = list_drafts(DB_FILE)  # [(id, text)]
     if not drafts:
         await context.bot.send_message(SOURCE_CHAT_ID, "📁 No hay borradores.")
         return
-    out = ["🗒️ Borradores pendientes:"]
+    out = ["📋 Borradores pendientes:"]
     for i, (did, snip) in enumerate(drafts, start=1):
         s = (snip or "").strip()
         if len(s) > 60:
@@ -245,7 +252,10 @@ async def _cmd_listar(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _cmd_eliminar(update: Update, context: ContextTypes.DEFAULT_TYPE, txt: str):
+    # por id explícito
     mid = _extract_id_from_text(txt)
+
+    # o por reply
     if not mid and update.channel_post and update.channel_post.reply_to_message:
         mid = update.channel_post.reply_to_message.message_id
 
@@ -275,6 +285,7 @@ async def _cmd_deshacer(update: Update, context: ContextTypes.DEFAULT_TYPE, txt:
 
 
 async def _cmd_programar(context: ContextTypes.DEFAULT_TYPE, when_str: str):
+    # when_str: "YYYY-MM-DD HH:MM"
     try:
         when = datetime.strptime(when_str, "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
     except Exception:
@@ -285,6 +296,7 @@ async def _cmd_programar(context: ContextTypes.DEFAULT_TYPE, when_str: str):
     seconds = max(0, int((when - now).total_seconds()))
 
     if not context.job_queue:
+        # Necesitas instalar el extra del job-queue
         await context.bot.send_message(
             SOURCE_CHAT_ID,
             "❌ No pude programar. Falta JobQueue. Asegúrate de usar "
@@ -294,106 +306,64 @@ async def _cmd_programar(context: ContextTypes.DEFAULT_TYPE, when_str: str):
         return
 
     async def job(ctx: ContextTypes.DEFAULT_TYPE):
-        deleted = count_deleted_unsent(DB_FILE)  # omitidos por /eliminar
         ok, fail = await _publicar_todo(ctx)
-        total = ok + fail + deleted
-        msg2 = f"⏱️ Programación ejecutada. Publicados {ok}.\n📦 Resultado: {ok}/{total} enviados."
-        if deleted:
-            msg2 += f" 🗑️ Omitidos por /eliminar: {deleted}."
+        msg2 = f"⏱️ Programación ejecutada. Publicados {ok}."
         if fail:
-            msg2 += " ⚠️ Revisa permisos y flood control."
+            msg2 += f" Fallidos: {fail}."
         await ctx.bot.send_message(SOURCE_CHAT_ID, msg2)
 
     context.job_queue.run_once(lambda ctx: asyncio.create_task(job(ctx)), when=seconds)
     await context.bot.send_message(SOURCE_CHAT_ID, f"🗓️ Programado para {when.astimezone(TZ):%Y-%m-%d %H:%M} ({TZNAME}).")
 
 
-async def _cmd_mensaje(context: ContextTypes.DEFAULT_TYPE, txt: str):
-    mid = _extract_id_from_text(txt)
-    if not mid:
-        await context.bot.send_message(SOURCE_CHAT_ID, "Usa: /mensaje <id>")
-        return
-
-    snippet = get_draft_snippet(DB_FILE, mid) or "[contenido]"
-    link = _build_channel_link(SOURCE_CHAT_ID, mid)
-    preview = f"*id:{mid}*\n{snippet}"
-    if link:
-        preview += f"\n\n[Ver en borrador]({link})"
-
-    try:
-        await context.bot.send_message(
-            SOURCE_CHAT_ID,
-            preview,
-            parse_mode="Markdown",
-            disable_web_page_preview=True,
-            reply_to_message_id=mid  # “señala” el mensaje
-        )
-    except BadRequest:
-        await context.bot.send_message(
-            SOURCE_CHAT_ID,
-            preview,
-            parse_mode="Markdown",
-            disable_web_page_preview=True
-        )
+def _is_command_text(txt: Optional[str]) -> bool:
+    return bool(txt and txt.strip().startswith("/"))
 
 
 # -------------------------------------------------------
 # Handler único de POSTS en el CANAL BORRADOR
 # -------------------------------------------------------
 async def handle_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.channel_post
-    if not msg or msg.chat_id != SOURCE_CHAT_ID:
+    msg = update.channel_post  # En canales es channel_post
+    if not msg:
+        return
+    if msg.chat_id != SOURCE_CHAT_ID:
         return
 
-    # Ignorar mensajes de servicio (pinned, joins, etc.)
-    if msg.pinned_message or msg.new_chat_members or msg.left_chat_member:
-        return
-
-    # Ignorar mensajes del propio bot
-    if msg.from_user and msg.from_user.is_bot:
-        return
-
-    txt_or_caption = (msg.text or msg.caption or "").strip()
+    txt = (msg.text or "").strip()
 
     # --------- COMANDOS (NO SE GUARDAN COMO BORRADOR) ----------
-    if _is_command_text(txt_or_caption):
-        low = txt_or_caption.lower()
+    if _is_command_text(txt):
+        low = txt.lower()
 
-        if low.startswith(("/listar", "/lista")):
-            await _cmd_listar(context);  return
+        if low.startswith("/listar") or low.startswith("/lista"):
+            await _cmd_listar(context)
+            return
 
         if low.startswith(("/eliminar", "/borrar", "/remover", "/delete", "/remove")):
-            await _cmd_eliminar(update, context, txt_or_caption);  return
+            await _cmd_eliminar(update, context, txt)
+            return
 
         if low.startswith(("/deshacer", "/undo", "/restaurar")):
-            await _cmd_deshacer(update, context, txt_or_caption);  return
+            await _cmd_deshacer(update, context, txt)
+            return
 
         if low.startswith("/enviar"):
-            deleted = count_deleted_unsent(DB_FILE)
             ok, fail = await _publicar_todo(context)
-            total = ok + fail + deleted
-            msg_out = (
-                f"✅ Publicados {ok}.\n"
-                f"📦 Resultado: {ok}/{total} enviados."
-            )
-            if deleted:
-                msg_out += f" 🗑️ Omitidos por /eliminar: {deleted}."
+            msg_out = f"✅ Publicados {ok}."
+            msg_out += f"\n📦 Resultado: {ok}/{ok+fail} enviados."
             if fail:
                 msg_out += " ⚠️ Revisa permisos y flood control."
             await context.bot.send_message(SOURCE_CHAT_ID, msg_out)
             return
 
         if low.startswith("/programar"):
-            parts = txt_or_caption.split(maxsplit=2)
+            parts = txt.split(maxsplit=2)
             if len(parts) >= 3:
                 when_str = f"{parts[1]} {parts[2]}"
                 await _cmd_programar(context, when_str)
             else:
                 await context.bot.send_message(SOURCE_CHAT_ID, "Usa: /programar YYYY-MM-DD HH:MM")
-            return
-
-        if low.startswith("/mensaje"):
-            await _cmd_mensaje(context, txt_or_caption)
             return
 
         if low.startswith("/id"):
@@ -411,18 +381,18 @@ async def handle_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "• /listar — muestra borradores pendientes\n"
                 "• /eliminar <id> — o responde con /eliminar al mensaje\n"
                 "• /deshacer [id] — revierte un /eliminar (o responde)\n"
-                "• /mensaje <id> — vista previa/enlace al borrador\n"
                 "• /enviar — publica ahora\n"
                 "• /programar YYYY-MM-DD HH:MM — programa el envío\n"
                 "• /id — muestra IDs\n"
-                "• /comandos — esta ayuda\n"
             )
             return
 
+        # Comando desconocido: simplemente ignora o avisa
         await context.bot.send_message(SOURCE_CHAT_ID, "Comando no reconocido. Usa /comandos.")
         return
 
     # --------- SI NO ES COMANDO → GUARDAR BORRADOR ----------
+    # snippet: usa texto o caption; si queda vacío, igual guardamos (imágenes/documentos)
     snippet = msg.text or msg.caption or ""
     raw_json = json.dumps(msg.to_dict(), ensure_ascii=False)
     save_draft(DB_FILE, msg.message_id, snippet, raw_json)
@@ -442,7 +412,10 @@ def main():
         .build()
     )
 
+    # En canales se usa MessageHandler con ChatType.CHANNEL
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel))
+
+    # Registrar error handler
     app.add_error_handler(on_error)
 
     logger.info("Bot iniciado 🚀 Escuchando channel_post en el BORRADOR.")
