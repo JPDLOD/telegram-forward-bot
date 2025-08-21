@@ -68,13 +68,13 @@ def _poll_payload_from_raw(raw: dict) -> Tuple[dict, bool]:
     """
     p = raw.get("poll") or {}
     question = p.get("question", "Pregunta")
-    options  = [o.get("text", "") for o in p.get("options", [])]
-    is_anon  = p.get("is_anonymous", True)
+    options_src = p.get("options", []) or []
+    options  = [o.get("text", "") for o in options_src]
 
-    # tipo & opción correcta
-    ptype = str(p.get("type", "regular")).lower()
-    coi = p.get("correct_option_id", None)
-    is_quiz = (ptype == "quiz") and isinstance(coi, int)
+    is_anon  = p.get("is_anonymous", True)
+    allows_multiple = p.get("allows_multiple_answers", False)
+    ptype = (p.get("type") or "regular").lower().strip()
+    is_quiz = (ptype == "quiz")
 
     kwargs = dict(
         chat_id=TARGET_CHAT_ID,
@@ -83,32 +83,39 @@ def _poll_payload_from_raw(raw: dict) -> Tuple[dict, bool]:
         is_anonymous=is_anon,
     )
 
-    # Para quiz: forzar type="quiz" y pasar correct_option_id.
-    # NO mandar allows_multiple_answers (lo prohíbe Telegram en quiz).
+    # Solo incluir allows_multiple si NO es quiz (Telegram rechaza quiz + multiple)
+    if not is_quiz:
+        kwargs["allows_multiple_answers"] = bool(allows_multiple)
+
+    # Quiz: respuesta correcta
     if is_quiz:
         kwargs["type"] = "quiz"
-        kwargs["correct_option_id"] = int(coi)
-        if p.get("explanation"):
-            kwargs["explanation"] = str(p["explanation"])
-    else:
-        # Para encuestas regulares, sí podemos respetar multiple answers.
-        allows_multiple = bool(p.get("allows_multiple_answers", False))
-        kwargs["allows_multiple_answers"] = allows_multiple
+        cid = p.get("correct_option_id")
+        try:
+            cid = int(cid) if cid is not None else None
+        except Exception:
+            cid = None
 
-    # Tiempos: para evitar 400 Bad Request, no enviamos ambos.
-    # Son opcionales, así que por estabilidad los omitimos (se pueden reactivar si lo necesitas).
-    # if p.get("open_period") is not None:
-    #     try:
-    #         op = int(p["open_period"])
-    #         if 5 <= op <= 600:
-    #             kwargs["open_period"] = op
-    #     except Exception:
-    #         pass
-    # elif p.get("close_date") is not None:
-    #     try:
-    #         kwargs["close_date"] = int(p["close_date"])
-    #     except Exception:
-    #         pass
+        # Asegurar que esté dentro del rango, si no, forzar 0
+        if cid is None or cid < 0 or cid >= len(options):
+            cid = 0
+        kwargs["correct_option_id"] = cid
+
+    # Tiempos (si existieran) – Telegram no permite open_period y close_date juntos
+    if p.get("open_period") is not None and p.get("close_date") is None:
+        try:
+            kwargs["open_period"] = int(p["open_period"])
+        except Exception:
+            pass
+    elif p.get("close_date") is not None:
+        try:
+            kwargs["close_date"] = int(p["close_date"])
+        except Exception:
+            pass
+
+    # Explicación (solo quiz)
+    if is_quiz and p.get("explanation"):
+        kwargs["explanation"] = str(p["explanation"])
 
     return kwargs, is_quiz
 
