@@ -67,19 +67,14 @@ def _poll_payload_from_raw(raw: dict) -> Tuple[dict, bool]:
     Devuelve (kwargs, is_quiz).
     """
     p = raw.get("poll") or {}
-    question = str(p.get("question", "Pregunta"))
+    question = p.get("question", "Pregunta")
+    options  = [o.get("text", "") for o in p.get("options", [])]
+    is_anon  = p.get("is_anonymous", True)
 
-    # Asegurar lista de strings (2–10 opciones)
-    options = [str(o.get("text", "")).strip() for o in p.get("options", []) if (o.get("text") is not None)]
-    options = [opt for opt in options if opt]
-    if len(options) < 2:
-        options = options + ["Opción 1", "Opción 2"]
-    if len(options) > 10:
-        options = options[:10]
-
-    is_anon = bool(p.get("is_anonymous", True))
-    ptype = p.get("type", "regular")
-    is_quiz = (ptype == "quiz")
+    # tipo & opción correcta
+    ptype = str(p.get("type", "regular")).lower()
+    coi = p.get("correct_option_id", None)
+    is_quiz = (ptype == "quiz") and isinstance(coi, int)
 
     kwargs = dict(
         chat_id=TARGET_CHAT_ID,
@@ -88,28 +83,32 @@ def _poll_payload_from_raw(raw: dict) -> Tuple[dict, bool]:
         is_anonymous=is_anon,
     )
 
+    # Para quiz: forzar type="quiz" y pasar correct_option_id.
+    # NO mandar allows_multiple_answers (lo prohíbe Telegram en quiz).
     if is_quiz:
-        # Forzar quiz y conservar correct_option_id incluso si es 0
         kwargs["type"] = "quiz"
-        if "correct_option_id" in p and p.get("correct_option_id") is not None:
-            try:
-                kwargs["correct_option_id"] = int(p["correct_option_id"])
-            except Exception:
-                pass
+        kwargs["correct_option_id"] = int(coi)
         if p.get("explanation"):
             kwargs["explanation"] = str(p["explanation"])
-        # Importante: NO mandar allows_multiple_answers en quiz
     else:
-        # Solo en encuestas regulares
-        kwargs["allows_multiple_answers"] = bool(p.get("allows_multiple_answers", False))
+        # Para encuestas regulares, sí podemos respetar multiple answers.
+        allows_multiple = bool(p.get("allows_multiple_answers", False))
+        kwargs["allows_multiple_answers"] = allows_multiple
 
-    # Ventanas de tiempo (opcionales)
-    if p.get("open_period") is not None:
-        try: kwargs["open_period"] = int(p["open_period"])
-        except Exception: pass
-    if p.get("close_date") is not None:
-        try: kwargs["close_date"] = int(p["close_date"])
-        except Exception: pass
+    # Tiempos: para evitar 400 Bad Request, no enviamos ambos.
+    # Son opcionales, así que por estabilidad los omitimos (se pueden reactivar si lo necesitas).
+    # if p.get("open_period") is not None:
+    #     try:
+    #         op = int(p["open_period"])
+    #         if 5 <= op <= 600:
+    #             kwargs["open_period"] = op
+    #     except Exception:
+    #         pass
+    # elif p.get("close_date") is not None:
+    #     try:
+    #         kwargs["close_date"] = int(p["close_date"])
+    #     except Exception:
+    #         pass
 
     return kwargs, is_quiz
 
@@ -192,12 +191,7 @@ async def _publicar_todo(context: ContextTypes.DEFAULT_TYPE) -> Tuple[int, int]:
             kwargs, _is_quiz = _poll_payload_from_raw(data)
 
             async def _do():
-                try:
-                    await context.bot.send_poll(**kwargs)
-                except BadRequest as e:
-                    # Si Telegram rechaza, deja registro visible
-                    await context.bot.send_message(SOURCE_CHAT_ID, f"❌ No pude enviar la encuesta id:{mid}: {e.message}")
-                    raise
+                await context.bot.send_poll(**kwargs)
 
             ok = await _send_with_backoff(_do, base_pause=PAUSE)
 
