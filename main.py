@@ -29,8 +29,8 @@ from typing import Tuple, Optional, List
 
 from zoneinfo import ZoneInfo
 
-from telegram import Update
-from telegram.ext import Application, MessageHandler, ContextTypes, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, MessageHandler, ContextTypes, CallbackQueryHandler, filters
 from telegram.error import (
     TelegramError, Forbidden, BadRequest, RetryAfter, TimedOut, NetworkError
 )
@@ -511,6 +511,66 @@ def _is_command_text(txt: Optional[str]) -> bool:
 
 
 # -------------------------------------------------------
+# Ayuda con botones "clickeables" para canal
+# -------------------------------------------------------
+async def _send_help_with_buttons(context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "🛠️ Comandos:\n"
+        "• /listar — muestra borradores pendientes\n"
+        "• /cancelar <id> — o responde con /cancelar (no borra del canal)\n"
+        "• /deshacer [id] — revierte un /cancelar (o responde)\n"
+        "• /eliminar <id> — o responde (BORRA del canal y de la cola)\n"
+        "• /nuke <N> — borra del canal los últimos N pendientes\n"
+        "• /enviar — publica ahora\n"
+        "• /programar YYYY-MM-DD HH:MM — programa el envío\n"
+        "• /id [id] — info del mensaje o, si respondes, te dice el ID\n"
+        "• /canales — muestra IDs del BORRADOR y PRINCIPAL\n"
+        "• /comandos — muestra este panel de ayuda\n"
+    )
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📋 Listar", callback_data="do:listar"),
+             InlineKeyboardButton("📦 Enviar", callback_data="do:enviar")],
+            [InlineKeyboardButton("🆔 Canales", callback_data="do:canales")]
+        ]
+    )
+    await context.bot.send_message(SOURCE_CHAT_ID, text, reply_markup=kb)
+
+
+# -------------------------------------------------------
+# Handler de callbacks (botones)
+# -------------------------------------------------------
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+    data = q.data or ""
+    try:
+        if data == "do:listar":
+            await _cmd_listar(context)
+        elif data == "do:enviar":
+            ok, fail = await _publicar_todo(context)
+            msg_out = f"✅ Publicados {ok}."
+            extras = []
+            if _STATS["cancelados"]:
+                extras.append(f"Cancelados: {_STATS['cancelados']}")
+            if _STATS["eliminados"]:
+                extras.append(f"Eliminados: {_STATS['eliminados']}")
+            if fail:
+                extras.append(f"Fallidos: {fail}")
+            if extras:
+                msg_out += "\n📦 " + " · ".join(extras) + "."
+            await context.bot.send_message(SOURCE_CHAT_ID, msg_out)
+            _STATS["cancelados"] = 0
+            _STATS["eliminados"] = 0
+        elif data == "do:canales":
+            await _cmd_canales(context)
+    except Exception as e:
+        logger.exception(f"Error en callback: {e}")
+
+
+# -------------------------------------------------------
 # Handler único de POSTS en el CANAL BORRADOR
 # -------------------------------------------------------
 async def handle_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -593,19 +653,7 @@ async def handle_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # comandos/ayuda/start
         if low.startswith(("/comandos", "/comando", "/ayuda", "/start")):
-            await context.bot.send_message(
-                SOURCE_CHAT_ID,
-                "🛠️ Comandos:\n"
-                "• /listar — muestra borradores pendientes\n"
-                "• /cancelar <id> — o responde con /cancelar (no borra del canal)\n"
-                "• /deshacer [id] — revierte un /cancelar (o responde)\n"
-                "• /eliminar <id> — o responde (BORRA del canal y de la cola)\n"
-                "• /nuke <N> — borra del canal los últimos N pendientes\n"
-                "• /enviar — publica ahora\n"
-                "• /programar YYYY-MM-DD HH:MM — programa el envío\n"
-                "• /id [id] — info del mensaje o, si respondes, te dice el ID\n"
-                "• /canales — muestra IDs del BORRADOR y PRINCIPAL\n"
-            )
+            await _send_help_with_buttons(context)
             return
 
         # Comando desconocido
@@ -635,12 +683,14 @@ def main():
 
     # En canales se usa MessageHandler con ChatType.CHANNEL
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel))
+    # Botones de ayuda (callback)
+    app.add_handler(CallbackQueryHandler(handle_callback))
 
     # Registrar error handler
     app.add_error_handler(on_error)
 
     logger.info("Bot iniciado 🚀 Escuchando channel_post en el BORRADOR.")
-    app.run_polling(allowed_updates=["channel_post"], drop_pending_updates=True)
+    app.run_polling(allowed_updates=["channel_post", "callback_query"], drop_pending_updates=True)
 
 
 if __name__ == "__main__":
