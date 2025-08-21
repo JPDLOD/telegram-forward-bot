@@ -666,7 +666,7 @@ async def handle_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # eliminar (borrar del canal + cola)
-        if low.startswith(("/eliminar", "/delete", "/remove", "/borrar", "/del")):
+        if low.startswith(("/eliminar", "/delete", "/remove", "/borrar")):
             await _cmd_eliminar(update, context, txt)
             return
 
