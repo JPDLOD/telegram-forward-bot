@@ -8,8 +8,8 @@
 #   /listar
 #   /cancelar <id>  (o responde con /cancelar)  ← quita de la cola sin borrar el mensaje del canal
 #   /deshacer [id]  (o responde)                ← revierte un /cancelar
-#   /eliminar <id>  (alias: /delete, /remove, /borrar)  ← BORRA del canal y lo quita de la cola
-#   /nuke <patrón>  ← borra del CANAL los pendientes según patrón (ver ayuda)
+#   /eliminar <id>  (alias: /del, /delete, /remove, /borrar)  ← BORRA del canal y lo quita de la cola
+#   /nuke <…>       ← ver ayuda en /comandos (all/todos, 1,3,5, 1-10, N últimos)
 #   /enviar
 #   /programar YYYY-MM-DD HH:MM
 #   /id [id]        ← info del mensaje/ID; si respondes a un mensaje, te dice su ID
@@ -25,7 +25,7 @@ import asyncio
 import logging
 import sqlite3
 from datetime import datetime
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional, List, Set
 
 from zoneinfo import ZoneInfo
 
@@ -477,79 +477,83 @@ async def _cmd_canales(context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-def _parse_nuke_pattern(arg: str, ordered_ids: List[int]) -> List[int]:
+def _parse_nuke_selection(arg: str, drafts: List[Tuple[int, str]]) -> Set[int]:
     """
-    Convierte un patrón como:
-      - "all"
-      - "1,3,5,7"
-      - "1-10"
-      - combinación: "1-3,7,12-15"
-    a una lista de message_ids a borrar (según orden de /listar).
+    Convierte una selección textual basada en posiciones de /listar a IDs de mensajes.
+    Soporta:
+      - 'all' / 'todos' → todos
+      - '1,3,5' → lista de posiciones
+      - '2-7' → rango
+      - número simple 'N' → interpreta como 'últimos N'
     """
     arg = (arg or "").strip().lower()
+    ids_in_order = [did for (did, _snip) in drafts]  # orden /listar (ASC por created_at)
+    result: Set[int] = set()
+
     if not arg:
-        return []
+        return result
 
-    if arg == "all":
-        return ordered_ids[:]
+    if arg in ("all", "todos"):
+        result.update(ids_in_order)
+        return result
 
-    result_idx: List[int] = []
-    parts = [p.strip() for p in arg.split(",") if p.strip()]
-    for tok in parts:
-        if "-" in tok:
-            a, b = tok.split("-", 1)
-            if a.isdigit() and b.isdigit():
-                ai, bi = int(a), int(b)
-                if ai <= bi:
-                    result_idx.extend(list(range(ai, bi + 1)))
-                else:
-                    result_idx.extend(list(range(bi, ai + 1)))
-        elif tok.isdigit():
-            result_idx.append(int(tok))
+    # Solo número → últimos N
+    if arg.isdigit():
+        n = int(arg)
+        if n > 0:
+            result.update(ids_in_order[-n:])
+        return result
 
-    # Normalizar a límites válidos y únicos, preservando orden
-    max_idx = len(ordered_ids)
-    seen = set()
-    final_ids: List[int] = []
-    for i in result_idx:
-        if 1 <= i <= max_idx:
-            if i not in seen:
-                seen.add(i)
-                final_ids.append(ordered_ids[i - 1])
-    return final_ids
+    # Lista separada por comas y/o rangos
+    pieces = [p.strip() for p in arg.split(",") if p.strip()]
+    for p in pieces:
+        if re.fullmatch(r"\d+-\d+", p):
+            a, b = p.split("-")
+            a, b = int(a), int(b)
+            if a <= 0 or b <= 0:
+                continue
+            lo, hi = min(a, b), max(a, b)
+            # posiciones son 1‑based
+            for pos in range(lo, hi + 1):
+                idx = pos - 1
+                if 0 <= idx < len(ids_in_order):
+                    result.add(ids_in_order[idx])
+        elif p.isdigit():
+            pos = int(p)
+            idx = pos - 1
+            if 0 <= idx < len(ids_in_order):
+                result.add(ids_in_order[idx])
+        # si no coincide, lo ignoramos silenciosamente
+
+    return result
 
 
 async def _cmd_nuke(context: ContextTypes.DEFAULT_TYPE, txt: str):
     """
-    /nuke <patrón>
-      all             → borra TODOS los pendientes
-      1,3,5,7         → borra esos índices
-      1-10            → borra del 1 al 10
-      1-3,7,12-15     → combina rangos y elementos
+    /nuke all|todos
+    /nuke 1,3,5
+    /nuke 1-10
+    /nuke N        ← borra los últimos N (comportamiento anterior)
     """
     parts = (txt or "").split(maxsplit=1)
-    if len(parts) < 2:
-        await context.bot.send_message(
-            SOURCE_CHAT_ID,
-            "Usa: /nuke <patrón>\n"
-            "Ejemplos: /nuke all · /nuke 1-10 · /nuke 1,3,5,7 · /nuke 1-3,7,12-15"
-        )
-        return
+    arg = parts[1] if len(parts) > 1 else ""
 
-    # ids pendientes en el mismo orden que /listar
-    pending_rows = list_drafts(DB_FILE)  # [(id, text)]
-    ordered_ids = [r[0] for r in pending_rows]
-    if not ordered_ids:
+    drafts = list_drafts(DB_FILE)  # [(id, text)] en orden /listar
+    if not drafts:
         await context.bot.send_message(SOURCE_CHAT_ID, "No hay pendientes.")
         return
 
-    victims = _parse_nuke_pattern(parts[1], ordered_ids)
+    victims: Set[int] = _parse_nuke_selection(arg, drafts)
     if not victims:
-        await context.bot.send_message(SOURCE_CHAT_ID, "Patrón sin coincidencias.")
+        await context.bot.send_message(
+            SOURCE_CHAT_ID,
+            "Usa: /nuke all | /nuke todos | /nuke 1,3,5 | /nuke 1-10 | /nuke N"
+        )
         return
 
     borrados = 0
-    for mid in victims:
+    # Borramos desde los más recientes para evitar dependencias de Telegram
+    for mid in sorted(victims, reverse=True):
         try:
             await context.bot.delete_message(chat_id=SOURCE_CHAT_ID, message_id=mid)
         except TelegramError as e:
@@ -559,10 +563,7 @@ async def _cmd_nuke(context: ContextTypes.DEFAULT_TYPE, txt: str):
 
     _STATS["eliminados"] += borrados
     restantes = len(list_drafts(DB_FILE))
-    await context.bot.send_message(
-        SOURCE_CHAT_ID,
-        f"💣 Nuke: {borrados} borrados según patrón. Quedan {restantes} en la cola."
-    )
+    await context.bot.send_message(SOURCE_CHAT_ID, f"💣 Nuke: {borrados} borrados. Quedan {restantes} en la cola.")
 
 
 def _is_command_text(txt: Optional[str]) -> bool:
@@ -578,8 +579,8 @@ async def _send_help_with_buttons(context: ContextTypes.DEFAULT_TYPE):
         "• /listar — muestra borradores pendientes\n"
         "• /cancelar <id> — o responde con /cancelar (no borra del canal)\n"
         "• /deshacer [id] — revierte un /cancelar (o responde)\n"
-        "• /eliminar <id> — o responde (BORRA del canal y de la cola)\n"
-        "• /nuke <patrón> — borra del canal pendientes según patrón (all, 1-10, 1,3,5,7)\n"
+        "• /eliminar <id> — o responde (BORRA del canal y de la cola)  [alias: /del]\n"
+        "• /nuke all|todos | /nuke 1,3,5 | /nuke 1-10 | /nuke N(últimos)\n"
         "• /enviar — publica ahora\n"
         "• /programar YYYY-MM-DD HH:MM — programa el envío\n"
         "• /id [id] — info del mensaje o, si respondes, te dice el ID\n"
@@ -590,7 +591,7 @@ async def _send_help_with_buttons(context: ContextTypes.DEFAULT_TYPE):
         [
             [InlineKeyboardButton("📋 Listar", callback_data="do:listar"),
              InlineKeyboardButton("📦 Enviar", callback_data="do:enviar")],
-            [InlineKeyboardButton("🗓️ Programar", callback_data="do:programar"),
+            [InlineKeyboardButton("🕒 Programar", callback_data="do:programar_help"),
              InlineKeyboardButton("🛠️ Comandos", callback_data="do:help")]
         ]
     )
@@ -624,13 +625,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(SOURCE_CHAT_ID, msg_out)
             _STATS["cancelados"] = 0
             _STATS["eliminados"] = 0
-        elif data == "do:programar":
+        elif data == "do:programar_help":
             await context.bot.send_message(
                 SOURCE_CHAT_ID,
-                "Formato: `/programar YYYY-MM-DD HH:MM`\n"
+                "⌛ Para programar, usa el formato:\n"
+                "`/programar YYYY-MM-DD HH:MM`\n\n"
                 "Ejemplos:\n"
-                "• `/programar 2025-08-20 07:00`\n"
-                "• `/programar 2025-08-21 17:30`",
+                "• `/programar 2025-08-21 07:00`\n"
+                "• `/programar 2025-08-21 19:30`\n",
                 parse_mode="Markdown"
             )
         elif data == "do:help":
@@ -656,7 +658,7 @@ async def handle_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         low = txt.lower()
 
         # listar
-        if low.startswith("/listar") o r low.startswith("/lista"):
+        if low.startswith("/listar") or low.startswith("/lista"):
             await _cmd_listar(context)
             return
 
@@ -666,7 +668,7 @@ async def handle_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # eliminar (borrar del canal + cola)
-        if low.startswith(("/eliminar", "/delete", "/remove", "/borrar")):
+        if low.startswith(("/eliminar", "/del", "/delete", "/remove", "/borrar")):
             await _cmd_eliminar(update, context, txt)
             return
 
@@ -675,9 +677,12 @@ async def handle_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _cmd_deshacer(update, context, txt)
             return
 
-        # nuke (ahora por patrón)
+        # nuke (incluye /all y /todos como atajos a nuke all)
         if low.startswith("/nuke"):
             await _cmd_nuke(context, txt)
+            return
+        if low.strip() in ("/all", "/todos"):
+            await _cmd_nuke(context, "/nuke all")
             return
 
         # enviar
