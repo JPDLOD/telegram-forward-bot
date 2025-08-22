@@ -2,9 +2,7 @@
 import os
 from zoneinfo import ZoneInfo
 
-# =========================
-# CONFIG DESDE ENV
-# =========================
+# ============== CONFIG DESDE ENV ==============
 BOT_TOKEN = os.environ["BOT_TOKEN"]  # obligatorio
 
 # Canales por defecto (puedes override con ENV)
