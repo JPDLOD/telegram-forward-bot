@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-# BORRADOR (SOURCE_CHAT_ID) -> PRINCIPAL (TARGET_CHAT_ID)
+# BORRADOR (SOURCE_CHAT_ID) -> PRINCIPAL (TARGET_CHAT_ID) (+ BACKUP opcional)
 # Guarda todo lo que publiques en BORRADOR y, al usar /enviar o /programar,
-# lo publica en PRINCIPAL en el MISMO ORDEN, sin "Forwarded from...".
+# lo publica en PRINCIPAL (y BACKUP si está ON) en el MISMO ORDEN, sin "Forwarded from...".
 # Reconstruye encuestas (quiz/regular) y copia el resto de mensajes.
 #
 # Comandos en el canal BORRADOR:
@@ -11,9 +11,12 @@
 #   /eliminar <id>  (alias: /del, /delete, /remove, /borrar)  ← BORRA del canal y lo quita de la cola
 #   /nuke <…>       ← ver ayuda en /comandos (all/todos, 1,3,5, 1-10, N últimos)
 #   /enviar
+#   /preview        ← envía la cola a PREVIEW sin marcar como enviada
+#   /undo_send      ← borra en targets el último lote que envió el bot
 #   /programar YYYY-MM-DD HH:MM
 #   /id [id]        ← info del mensaje/ID; si respondes a un mensaje, te dice su ID
-#   /canales        ← muestra los IDs del canal borrador y el principal
+#   /canales        ← IDs + estado de targets (alias: /targets, /where)
+#   /backup on|off  ← alterna SOLO el backup (principal siempre ON)
 #   /comandos (alias: /comando, /ayuda, /start)
 #
 # NOTA: Los mensajes que empiecen por "/" NO se guardan como borradores.
@@ -24,8 +27,8 @@ import json
 import asyncio
 import logging
 import sqlite3
-from datetime import datetime
-from typing import Tuple, Optional, List, Set
+from datetime import datetime, timedelta
+from typing import Tuple, Optional, List, Set, Dict
 
 from zoneinfo import ZoneInfo
 
@@ -46,6 +49,14 @@ from database import (
 BOT_TOKEN = os.environ["BOT_TOKEN"]  # obligatorio
 SOURCE_CHAT_ID = int(os.environ.get("SOURCE_CHAT_ID", "-1002859784457"))
 TARGET_CHAT_ID = int(os.environ.get("TARGET_CHAT_ID", "-1002679848195"))
+
+# Fallbacks por si no pones ENV (así no se rompe al actualizar)
+BACKUP_FALLBACK = -1002717125281   # reemplaza por tu backup real si quieres
+PREVIEW_FALLBACK = -1003042227035  # reemplaza por tu preview real si quieres
+
+BACKUP_CHAT_ID = int(os.environ.get("BACKUP_CHAT_ID", str(BACKUP_FALLBACK)))
+PREVIEW_CHAT_ID = int(os.environ.get("PREVIEW_CHAT_ID", str(PREVIEW_FALLBACK)))
+
 DB_FILE = "drafts.db"
 
 # pausa base entre envíos (seg) para no rozar el flood control
@@ -59,10 +70,27 @@ logger = logging.getLogger(__name__)
 
 # ========= DB =========
 init_db(DB_FILE)
-logger.info(f"SQLite listo. BORRADOR={SOURCE_CHAT_ID}  PRINCIPAL={TARGET_CHAT_ID}  TZ={TZNAME}  PAUSE={PAUSE}s")
+logger.info(
+    f"SQLite listo. BORRADOR={SOURCE_CHAT_ID}  PRINCIPAL={TARGET_CHAT_ID}  BACKUP={BACKUP_CHAT_ID}  "
+    f"PREVIEW={PREVIEW_CHAT_ID}  TZ={TZNAME}  PAUSE={PAUSE}s"
+)
+
+# ========= ESTADO DE TARGETS =========
+# Principal SIEMPRE ON (no se apaga para evitar accidentes)
+_ACTIVE_BACKUP = True  # por defecto ON cada vez que inicia el proceso
+
+def get_active_targets() -> List[int]:
+    targets = [TARGET_CHAT_ID]
+    if _ACTIVE_BACKUP and BACKUP_CHAT_ID:
+        targets.append(BACKUP_CHAT_ID)
+    return targets
 
 # ========= CONTADORES (para distinguir en /enviar) =========
 _STATS = {"cancelados": 0, "eliminados": 0}
+
+# ========= HISTÓRICO ÚLTIMO LOTE ENVIADO (para /undo_send) =========
+# Guarda los message_id publicados en cada target en el último /enviar o /programar ejecutado
+_LAST_BATCH: Dict[int, List[int]] = {}  # {chat_id_destino: [message_ids publicados allá]}
 
 
 # -------------------------------------------------------
@@ -120,8 +148,8 @@ def _get_pending_ids(db_file: str) -> List[int]:
 # -------------------------------------------------------
 def _poll_payload_from_raw(raw: dict) -> Tuple[dict, bool]:
     """
-    Extrae un payload listo para send_poll a partir de raw['poll'].
-    Devuelve (kwargs, is_quiz).
+    Extrae un payload *base* listo para send_poll a partir de raw['poll'] (sin chat_id).
+    Devuelve (kwargs_parciales, is_quiz).
     """
     p = raw.get("poll") or {}
     question = p.get("question", "Pregunta")
@@ -134,7 +162,6 @@ def _poll_payload_from_raw(raw: dict) -> Tuple[dict, bool]:
     is_quiz = (ptype == "quiz")
 
     kwargs = dict(
-        chat_id=TARGET_CHAT_ID,
         question=question,
         options=options,
         is_anonymous=is_anon,
@@ -184,21 +211,21 @@ async def _safe_sleep(seconds: float):
         pass
 
 
-async def _send_with_backoff(send_coro_func, *, base_pause: float) -> bool:
+async def _send_with_backoff(func_coro_factory, *, base_pause: float):
     """
     Ejecuta la corrutina de envío con control de flood y reintentos.
-    Devuelve True si se envió; False si definitivamente falló.
+    `func_coro_factory` debe ser un lambda que, al llamarse, devuelva la corrutina de envío.
+    Devuelve (ok: bool, result: Message|None)
     """
     tries = 0
     while True:
         try:
-            await send_coro_func()
+            msg = await func_coro_factory()
             await _safe_sleep(base_pause)
-            return True
+            return True, msg
         except RetryAfter as e:
             wait = getattr(e, "retry_after", None)
             if wait is None:
-                # Mensaje de texto tipo "Retry in X seconds"
                 m = re.search(r"Retry in (\d+)", str(e))
                 wait = int(m.group(1)) if m else 3
             logger.warning(f"RetryAfter: esperando {wait}s …")
@@ -213,7 +240,6 @@ async def _send_with_backoff(send_coro_func, *, base_pause: float) -> bool:
             await _safe_sleep(3.0)
             tries += 1
         except TelegramError as e:
-            # Flood genérico
             if "Flood control exceeded" in str(e):
                 m = re.search(r"Retry in (\d+)", str(e))
                 wait = int(m.group(1)) if m else 5
@@ -222,26 +248,32 @@ async def _send_with_backoff(send_coro_func, *, base_pause: float) -> bool:
                 tries += 1
             else:
                 logger.error(f"TelegramError no recuperable: {e}")
-                return False
+                return False, None
         except Exception as e:
             logger.exception(f"Error enviando: {e}")
-            return False
+            return False, None
 
         if tries >= 5:
             logger.error("Demasiados reintentos; abandono este mensaje.")
-            return False
+            return False, None
 
 
 # -------------------------------------------------------
-# Publicar todos los borradores pendientes en orden
+# Publicar borradores pendientes en uno o varios destinos
 # -------------------------------------------------------
-async def _publicar_todo(context: ContextTypes.DEFAULT_TYPE) -> Tuple[int, int]:
+async def _publicar(context: ContextTypes.DEFAULT_TYPE, *, targets: List[int], mark_as_sent: bool) -> Tuple[int, int, Dict[int, List[int]]]:
+    """
+    Envía la cola a los `targets` dados.
+    mark_as_sent=True → marca en DB como enviados (para PRINCIPAL/operaciones reales).
+    Devuelve (publicados, fallidos, posted_by_target) donde posted_by_target es {chat_id: [mids]}
+    """
     rows = get_unsent_drafts(DB_FILE)  # [(message_id, text, raw_json)]
     if not rows:
-        return 0, 0
+        return 0, 0, {t: [] for t in targets}
 
     publicados, fallidos = 0, 0
     enviados_ids = []
+    posted_by_target: Dict[int, List[int]] = {t: [] for t in targets}
 
     for mid, _t, raw in rows:
         try:
@@ -249,34 +281,50 @@ async def _publicar_todo(context: ContextTypes.DEFAULT_TYPE) -> Tuple[int, int]:
         except Exception:
             data = {}
 
-        ok = False
-        # ---- Encuesta: RECONSTRUIR ----
-        if "poll" in data:
-            kwargs, _is_quiz = _poll_payload_from_raw(data)
+        any_success = False
 
-            async def _do():
-                await context.bot.send_poll(**kwargs)
+        for dest in targets:
+            if "poll" in data:
+                base_kwargs, _is_quiz = _poll_payload_from_raw(data)
+                kwargs = dict(base_kwargs)
+                kwargs["chat_id"] = dest
 
-            ok = await _send_with_backoff(_do, base_pause=PAUSE)
-
-        # ---- Resto: copiar tal cual ----
-        else:
-            async def _do():
-                await context.bot.copy_message(
-                    chat_id=TARGET_CHAT_ID,
-                    from_chat_id=SOURCE_CHAT_ID,
-                    message_id=mid
+                coro_factory = lambda k=kwargs: context.bot.send_poll(**k)
+                ok, msg = await _send_with_backoff(coro_factory, base_pause=PAUSE)
+            else:
+                # copia tal cual
+                coro_factory = lambda d=dest, m=mid: context.bot.copy_message(
+                    chat_id=d, from_chat_id=SOURCE_CHAT_ID, message_id=m
                 )
-            ok = await _send_with_backoff(_do, base_pause=PAUSE)
+                ok, msg = await _send_with_backoff(coro_factory, base_pause=PAUSE)
 
-        if ok:
-            publicados += 1
+            if ok:
+                any_success = True
+                publicados += 1  # contamos por mensaje y por target (si quieres contarlo una vez, comenta esta línea)
+                if msg and getattr(msg, "message_id", None):
+                    posted_by_target[dest].append(msg.message_id)
+            else:
+                fallidos += 1
+
+        if any_success and mark_as_sent:
             enviados_ids.append(mid)
-        else:
-            fallidos += 1
 
-    if enviados_ids:
+    if enviados_ids and mark_as_sent:
         mark_sent(DB_FILE, enviados_ids)
+
+    return publicados, fallidos, posted_by_target
+
+
+# -------------------------------------------------------
+# Enviar a targets activos (PRINCIPAL + BACKUP si ON)
+# -------------------------------------------------------
+async def _publicar_todo_activos(context: ContextTypes.DEFAULT_TYPE) -> Tuple[int, int]:
+    publicados, fallidos, posted = await _publicar(
+        context, targets=get_active_targets(), mark_as_sent=True
+    )
+    # Guardamos último lote para /undo_send
+    global _LAST_BATCH
+    _LAST_BATCH = posted
     return publicados, fallidos
 
 
@@ -369,7 +417,6 @@ async def _cmd_deshacer(update: Update, context: ContextTypes.DEFAULT_TYPE, txt:
         return
 
     restore_draft(DB_FILE, mid)
-    # Si estaba contado como cancelado en esta sesión, decrementamos visualmente
     if _STATS["cancelados"] > 0:
         _STATS["cancelados"] -= 1
     restantes = len(list_drafts(DB_FILE))
@@ -388,7 +435,6 @@ async def _cmd_programar(context: ContextTypes.DEFAULT_TYPE, when_str: str):
     seconds = max(0, int((when - now).total_seconds()))
 
     if not context.job_queue:
-        # Necesitas instalar el extra del job-queue
         await context.bot.send_message(
             SOURCE_CHAT_ID,
             "❌ No pude programar. Falta JobQueue. Asegúrate de usar "
@@ -398,7 +444,7 @@ async def _cmd_programar(context: ContextTypes.DEFAULT_TYPE, when_str: str):
         return
 
     async def job(ctx: ContextTypes.DEFAULT_TYPE):
-        ok, fail = await _publicar_todo(ctx)
+        ok, fail = await _publicar_todo_activos(ctx)
         msg2 = f"⏱️ Programación ejecutada. Publicados {ok}."
         extra = []
         if _STATS["cancelados"]:
@@ -410,7 +456,6 @@ async def _cmd_programar(context: ContextTypes.DEFAULT_TYPE, when_str: str):
         if extra:
             msg2 += " " + " · ".join(extra) + "."
         await ctx.bot.send_message(SOURCE_CHAT_ID, msg2)
-        # reset contadores
         _STATS["cancelados"] = 0
         _STATS["eliminados"] = 0
 
@@ -420,13 +465,11 @@ async def _cmd_programar(context: ContextTypes.DEFAULT_TYPE, when_str: str):
 
 async def _cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE, txt: str):
     """/id [id] — info del mensaje; o si respondes, devuelve su ID."""
-    # Si viene por reply sin parámetro → devolvemos ID rápido
     if update.channel_post and update.channel_post.reply_to_message and len((txt or "").split()) == 1:
         rid = update.channel_post.reply_to_message.message_id
         await context.bot.send_message(SOURCE_CHAT_ID, f"🆔 ID del mensaje: {rid}")
         return
 
-    # Con número explícito
     mid = _extract_id_from_text(txt) or (txt.split()[1] if len(txt.split()) > 1 and txt.split()[1].isdigit() else None)
     if not mid:
         await context.bot.send_message(SOURCE_CHAT_ID, "Usa: /id <id> o responde a un mensaje con /id.")
@@ -434,7 +477,6 @@ async def _cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE, txt: str):
     mid = int(mid)
 
     row = _get_draft_row(DB_FILE, mid)
-    # Preparar snippet y tipo
     snippet = "[contenido]"
     tipo = "desconocido"
     fecha = ""
@@ -469,14 +511,6 @@ async def _cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE, txt: str):
     await context.bot.send_message(SOURCE_CHAT_ID, out)
 
 
-async def _cmd_canales(context: ContextTypes.DEFAULT_TYPE):
-    await context.bot.send_message(
-        SOURCE_CHAT_ID,
-        f"BORRADOR: `{SOURCE_CHAT_ID}`\nPRINCIPAL: `{TARGET_CHAT_ID}`",
-        parse_mode="Markdown"
-    )
-
-
 def _parse_nuke_selection(arg: str, drafts: List[Tuple[int, str]]) -> Set[int]:
     """
     Convierte una selección textual basada en posiciones de /listar a IDs de mensajes.
@@ -497,14 +531,12 @@ def _parse_nuke_selection(arg: str, drafts: List[Tuple[int, str]]) -> Set[int]:
         result.update(ids_in_order)
         return result
 
-    # Solo número → últimos N
     if arg.isdigit():
         n = int(arg)
         if n > 0:
             result.update(ids_in_order[-n:])
         return result
 
-    # Lista separada por comas y/o rangos
     pieces = [p.strip() for p in arg.split(",") if p.strip()]
     for p in pieces:
         if re.fullmatch(r"\d+-\d+", p):
@@ -513,7 +545,6 @@ def _parse_nuke_selection(arg: str, drafts: List[Tuple[int, str]]) -> Set[int]:
             if a <= 0 or b <= 0:
                 continue
             lo, hi = min(a, b), max(a, b)
-            # posiciones son 1‑based
             for pos in range(lo, hi + 1):
                 idx = pos - 1
                 if 0 <= idx < len(ids_in_order):
@@ -523,8 +554,6 @@ def _parse_nuke_selection(arg: str, drafts: List[Tuple[int, str]]) -> Set[int]:
             idx = pos - 1
             if 0 <= idx < len(ids_in_order):
                 result.add(ids_in_order[idx])
-        # si no coincide, lo ignoramos silenciosamente
-
     return result
 
 
@@ -552,7 +581,6 @@ async def _cmd_nuke(context: ContextTypes.DEFAULT_TYPE, txt: str):
         return
 
     borrados = 0
-    # Borramos desde los más recientes para evitar dependencias de Telegram
     for mid in sorted(victims, reverse=True):
         try:
             await context.bot.delete_message(chat_id=SOURCE_CHAT_ID, message_id=mid)
@@ -566,13 +594,18 @@ async def _cmd_nuke(context: ContextTypes.DEFAULT_TYPE, txt: str):
     await context.bot.send_message(SOURCE_CHAT_ID, f"💣 Nuke: {borrados} borrados. Quedan {restantes} en la cola.")
 
 
-def _is_command_text(txt: Optional[str]) -> bool:
-    return bool(txt and txt.strip().startswith("/"))
-
-
 # -------------------------------------------------------
-# Ayuda con botones "clickeables" para canal
+# Ayuda / panel con botones
 # -------------------------------------------------------
+def _targets_status_text() -> str:
+    onoff = "ON" if _ACTIVE_BACKUP else "OFF"
+    return (
+        "📡 **Targets**\n"
+        f"• Principal: `{TARGET_CHAT_ID}` **ON** (fijo)\n"
+        f"• Backup   : `{BACKUP_CHAT_ID}` **{onoff}**\n"
+        f"• Preview  : `{PREVIEW_CHAT_ID}`\n"
+    )
+
 async def _send_help_with_buttons(context: ContextTypes.DEFAULT_TYPE):
     text = (
         "🛠️ Comandos:\n"
@@ -581,21 +614,46 @@ async def _send_help_with_buttons(context: ContextTypes.DEFAULT_TYPE):
         "• /deshacer [id] — revierte un /cancelar (o responde)\n"
         "• /eliminar <id> — o responde (BORRA del canal y de la cola)  [alias: /del]\n"
         "• /nuke all|todos | /nuke 1,3,5 | /nuke 1-10 | /nuke N(últimos)\n"
-        "• /enviar — publica ahora\n"
-        "• /programar YYYY-MM-DD HH:MM — programa el envío\n"
+        "• /enviar — publica ahora (a targets activos)\n"
+        "• /preview — manda la cola a PREVIEW sin marcar como enviada\n"
+        "• /undo_send — borra el último lote enviado por el bot en los targets\n"
+        "• /programar YYYY-MM-DD HH:MM — programa el envío (targets activos)\n"
         "• /id [id] — info del mensaje o, si respondes, te dice el ID\n"
-        "• /canales — muestra IDs del BORRADOR y PRINCIPAL\n"
-        "• /comandos — muestra este panel de ayuda\n"
+        "• /canales — IDs + estado de targets (alias: /targets, /where)\n"
+        "• /backup on|off — alterna el backup\n"
     )
     kb = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("📋 Listar", callback_data="do:listar"),
              InlineKeyboardButton("📦 Enviar", callback_data="do:enviar")],
-            [InlineKeyboardButton("🕒 Programar", callback_data="do:programar_help"),
-             InlineKeyboardButton("🛠️ Comandos", callback_data="do:help")]
+            [InlineKeyboardButton("🧪 Preview", callback_data="do:preview"),
+             InlineKeyboardButton("⏰ Programar", callback_data="do:programar_menu")],
+            [InlineKeyboardButton("🔀 Backup ON/OFF", callback_data="do:backup_toggle"),
+             InlineKeyboardButton("ℹ️ Canales", callback_data="do:canales")]
         ]
     )
     await context.bot.send_message(SOURCE_CHAT_ID, text, reply_markup=kb)
+
+
+async def _send_canales_panel(context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        _targets_status_text() +
+        "\nUsa **/backup on|off** o el botón para alternar backup.\n"
+        "Botones rápidos abajo 👇"
+    )
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📋 Listar", callback_data="do:listar"),
+             InlineKeyboardButton("📦 Enviar", callback_data="do:enviar")],
+            [InlineKeyboardButton("🧪 Preview", callback_data="do:preview"),
+             InlineKeyboardButton("🔀 Backup ON/OFF", callback_data="do:backup_toggle")],
+            [InlineKeyboardButton("⏰ +15 min", callback_data="do:sched:+15"),
+             InlineKeyboardButton("⏰ +1 h", callback_data="do:sched:+60")],
+            [InlineKeyboardButton("⏰ Hoy 20:00", callback_data="do:sched:today2000"),
+             InlineKeyboardButton("⏰ Mañana 08:00", callback_data="do:sched:tom0800")]
+        ]
+    )
+    await context.bot.send_message(SOURCE_CHAT_ID, text, reply_markup=kb, parse_mode="Markdown")
 
 
 # -------------------------------------------------------
@@ -610,8 +668,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if data == "do:listar":
             await _cmd_listar(context)
+
         elif data == "do:enviar":
-            ok, fail = await _publicar_todo(context)
+            ok, fail = await _publicar_todo_activos(context)
             msg_out = f"✅ Publicados {ok}."
             extras = []
             if _STATS["cancelados"]:
@@ -625,20 +684,84 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(SOURCE_CHAT_ID, msg_out)
             _STATS["cancelados"] = 0
             _STATS["eliminados"] = 0
-        elif data == "do:programar_help":
-            await context.bot.send_message(
-                SOURCE_CHAT_ID,
-                "⌛ Para programar, usa el formato:\n"
-                "`/programar YYYY-MM-DD HH:MM`\n\n"
-                "Ejemplos:\n"
-                "• `/programar 2025-08-21 07:00`\n"
-                "• `/programar 2025-08-21 19:30`\n",
-                parse_mode="Markdown"
-            )
-        elif data == "do:help":
-            await _send_help_with_buttons(context)
+
+        elif data == "do:preview":
+            pubs, fails, _ = await _publicar(context, targets=[PREVIEW_CHAT_ID], mark_as_sent=False)
+            await context.bot.send_message(SOURCE_CHAT_ID, f"🧪 Preview: enviados {pubs}, fallidos {fails}.")
+
+        elif data == "do:programar_menu":
+            await _send_canales_panel(context)
+
+        elif data == "do:backup_toggle":
+            global _ACTIVE_BACKUP
+            _ACTIVE_BACKUP = not _ACTIVE_BACKUP
+            await _send_canales_panel(context)
+
+        elif data.startswith("do:sched:"):
+            now = datetime.now(tz=TZ)
+            when = None
+            if data == "do:sched:+15":
+                when = now + timedelta(minutes=15)
+            elif data == "do:sched:+60":
+                when = now + timedelta(hours=1)
+            elif data == "do:sched:today2000":
+                when = now.replace(hour=20, minute=0, second=0, microsecond=0)
+                if when <= now:
+                    when = when + timedelta(days=1)
+            elif data == "do:sched:tom0800":
+                when = (now + timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0)
+
+            if when:
+                await _cmd_programar(context, when.strftime("%Y-%m-%d %H:%M"))
+            else:
+                await context.bot.send_message(SOURCE_CHAT_ID, "No pude calcular la hora.")
+        elif data == "do:canales":
+            await _send_canales_panel(context)
+
     except Exception as e:
         logger.exception(f"Error en callback: {e}")
+
+
+# -------------------------------------------------------
+# Comandos adicionales: /preview, /undo_send, /canales, /backup
+# -------------------------------------------------------
+async def _cmd_preview(context: ContextTypes.DEFAULT_TYPE):
+    pubs, fails, _ = await _publicar(context, targets=[PREVIEW_CHAT_ID], mark_as_sent=False)
+    await context.bot.send_message(SOURCE_CHAT_ID, f"🧪 Preview: enviados {pubs}, fallidos {fails}.")
+
+async def _cmd_undo_send(context: ContextTypes.DEFAULT_TYPE):
+    if not _LAST_BATCH:
+        await context.bot.send_message(SOURCE_CHAT_ID, "No hay lote previo para deshacer.")
+        return
+    removed_total = 0
+    for dest, mids in _LAST_BATCH.items():
+        for mid in reversed(mids):
+            try:
+                await context.bot.delete_message(chat_id=dest, message_id=mid)
+                removed_total += 1
+            except TelegramError as e:
+                logger.warning(f"No pude borrar en {dest} mid:{mid} → {e}")
+    _LAST_BATCH.clear()
+    await context.bot.send_message(SOURCE_CHAT_ID, f"↩️ Undo send: {removed_total} mensajes borrados en los targets.")
+
+async def _cmd_canales(context: ContextTypes.DEFAULT_TYPE):
+    await _send_canales_panel(context)
+
+async def _cmd_backup(context: ContextTypes.DEFAULT_TYPE, arg: str):
+    global _ACTIVE_BACKUP
+    v = (arg or "").strip().lower()
+    if v in ("on", "1", "true", "si", "sí"):
+        _ACTIVE_BACKUP = True
+    elif v in ("off", "0", "false", "no"):
+        _ACTIVE_BACKUP = False
+    else:
+        await context.bot.send_message(SOURCE_CHAT_ID, "Usa: /backup on|off")
+        return
+    await _send_canales_panel(context)
+
+
+def _is_command_text(txt: Optional[str]) -> bool:
+    return bool(txt and txt.strip().startswith("/"))
 
 
 # -------------------------------------------------------
@@ -657,27 +780,22 @@ async def handle_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _is_command_text(txt):
         low = txt.lower()
 
-        # listar
         if low.startswith("/listar") or low.startswith("/lista"):
             await _cmd_listar(context)
             return
 
-        # cancelar (antes /eliminar lógico)
         if low.startswith(("/cancelar", "/cancel", "/skip")):
             await _cmd_cancelar(update, context, txt)
             return
 
-        # eliminar (borrar del canal + cola)
         if low.startswith(("/eliminar", "/del", "/delete", "/remove", "/borrar")):
             await _cmd_eliminar(update, context, txt)
             return
 
-        # deshacer
         if low.startswith(("/deshacer", "/undo", "/restaurar")):
             await _cmd_deshacer(update, context, txt)
             return
 
-        # nuke (incluye /all y /todos como atajos a nuke all)
         if low.startswith("/nuke"):
             await _cmd_nuke(context, txt)
             return
@@ -685,11 +803,9 @@ async def handle_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _cmd_nuke(context, "/nuke all")
             return
 
-        # enviar
         if low.startswith("/enviar"):
-            ok, fail = await _publicar_todo(context)
+            ok, fail = await _publicar_todo_activos(context)
             msg_out = f"✅ Publicados {ok}."
-            # Añadimos desglose:
             extras = []
             if _STATS["cancelados"]:
                 extras.append(f"Cancelados: {_STATS['cancelados']}")
@@ -700,12 +816,18 @@ async def handle_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if extras:
                 msg_out += "\n📦 " + " · ".join(extras) + "."
             await context.bot.send_message(SOURCE_CHAT_ID, msg_out)
-            # reset contadores
             _STATS["cancelados"] = 0
             _STATS["eliminados"] = 0
             return
 
-        # programar
+        if low.startswith("/preview"):
+            await _cmd_preview(context)
+            return
+
+        if low.startswith("/undo_send"):
+            await _cmd_undo_send(context)
+            return
+
         if low.startswith("/programar"):
             parts = txt.split(maxsplit=2)
             if len(parts) >= 3:
@@ -715,27 +837,28 @@ async def handle_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(SOURCE_CHAT_ID, "Usa: /programar YYYY-MM-DD HH:MM")
             return
 
-        # id (info de mensaje) – la versión de IDs de canales pasa a /canales
         if low.startswith("/id"):
             await _cmd_id(update, context, txt)
             return
 
-        # canales → IDs de chats
-        if low.startswith("/canales"):
+        if low.startswith(("/canales", "/targets", "/where")):
             await _cmd_canales(context)
             return
 
-        # comandos/ayuda/start
+        if low.startswith("/backup"):
+            parts = txt.split(maxsplit=1)
+            arg = parts[1] if len(parts) > 1 else ""
+            await _cmd_backup(context, arg)
+            return
+
         if low.startswith(("/comandos", "/comando", "/ayuda", "/start")):
             await _send_help_with_buttons(context)
             return
 
-        # Comando desconocido
         await context.bot.send_message(SOURCE_CHAT_ID, "Comando no reconocido. Usa /comandos.")
         return
 
     # --------- SI NO ES COMANDO → GUARDAR BORRADOR ----------
-    # snippet: usa texto o caption; si queda vacío, igual guardamos (imágenes/documentos)
     snippet = msg.text or msg.caption or ""
     raw_json = json.dumps(msg.to_dict(), ensure_ascii=False)
     save_draft(DB_FILE, msg.message_id, snippet, raw_json)
@@ -755,12 +878,9 @@ def main():
         .build()
     )
 
-    # En canales se usa MessageHandler con ChatType.CHANNEL
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel))
-    # Botones de ayuda (callback)
     app.add_handler(CallbackQueryHandler(handle_callback))
 
-    # Registrar error handler
     app.add_error_handler(on_error)
 
     logger.info("Bot iniciado 🚀 Escuchando channel_post en el BORRADOR.")
