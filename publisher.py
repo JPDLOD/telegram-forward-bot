@@ -6,33 +6,27 @@ from telegram.error import RetryAfter, TimedOut, NetworkError, TelegramError
 
 from config import DB_FILE, SOURCE_CHAT_ID, TARGET_CHAT_ID, BACKUP_CHAT_ID, PAUSE
 from database import get_unsent_drafts, mark_sent
-from utils import safe_sleep
+from utils import safe_sleep  # ← ahora existe por el shim
+# -------------------------------------
 
 logger = logging.getLogger(__name__)
 
-# ======= Estado de targets (centralizado) =======
-_ACTIVE_BACKUP: bool = True  # por defecto ON al iniciar
-
-def is_active_backup() -> bool:
-    """Devuelve el estado actual del backup."""
-    return _ACTIVE_BACKUP
-
-def set_active_backup(value: bool) -> None:
-    """Cambia el estado actual del backup (ON/OFF)."""
-    global _ACTIVE_BACKUP
-    _ACTIVE_BACKUP = bool(value)
+# Estado de targets
+ACTIVE_BACKUP: bool = True  # por defecto ON al iniciar
 
 def get_active_targets() -> List[int]:
     targets = [TARGET_CHAT_ID]
-    if is_active_backup() and BACKUP_CHAT_ID:
+    if ACTIVE_BACKUP and BACKUP_CHAT_ID:
         targets.append(BACKUP_CHAT_ID)
     return targets
 
-# ======= Contadores y locks =======
+# Contadores
 STATS = {"cancelados": 0, "eliminados": 0}
-SCHEDULED_LOCK: Set[int] = set()  # IDs programados: no se envían con /enviar ni /preview
 
-# ======= Envío con backoff =======
+# Lock de IDs programados (no se envían con /enviar ni /preview)
+SCHEDULED_LOCK: Set[int] = set()
+
+# ------------- envío con backoff -------------
 async def _send_with_backoff(func_coro_factory, *, base_pause: float):
     tries = 0
     while True:
@@ -51,20 +45,17 @@ async def _send_with_backoff(func_coro_factory, *, base_pause: float):
             tries += 1
         except TimedOut:
             logger.warning("TimedOut: esperando 3s …")
-            await safe_sleep(3.0)
-            tries += 1
+            await safe_sleep(3.0);  tries += 1
         except NetworkError:
             logger.warning("NetworkError: esperando 3s …")
-            await safe_sleep(3.0)
-            tries += 1
+            await safe_sleep(3.0);  tries += 1
         except TelegramError as e:
             if "Flood control exceeded" in str(e):
                 import re
                 m = re.search(r"Retry in (\d+)", str(e))
                 wait = int(m.group(1)) if m else 5
                 logger.warning(f"Flood control: esperando {wait}s …")
-                await safe_sleep(wait + 1.0)
-                tries += 1
+                await safe_sleep(wait + 1.0);  tries += 1
             else:
                 logger.error(f"TelegramError no recuperable: {e}")
                 return False, None
@@ -76,7 +67,7 @@ async def _send_with_backoff(func_coro_factory, *, base_pause: float):
             logger.error("Demasiados reintentos; abandono este mensaje.")
             return False, None
 
-# ======= Payload de encuestas =======
+# ------------- payload de encuestas -------------
 def _poll_payload_from_raw(raw: dict):
     p = raw.get("poll") or {}
     question = p.get("question", "Pregunta")
@@ -124,7 +115,7 @@ def _poll_payload_from_raw(raw: dict):
 
     return kwargs, is_quiz
 
-# ======= Publicar =======
+# ------------- publicar -------------
 async def publicar_rows(context, *, rows: List[Tuple[int, str, str]], targets: List[int], mark_as_sent: bool):
     publicados = 0
     fallidos = 0
@@ -170,7 +161,7 @@ async def publicar_rows(context, *, rows: List[Tuple[int, str, str]], targets: L
 
 async def publicar(context, *, targets: List[int], mark_as_sent: bool):
     """Envía la cola completa EXCLUYENDO los bloqueados (SCHEDULED_LOCK)."""
-    all_rows = get_unsent_drafts(DB_FILE)
+    all_rows = get_unsent_drafts(DB_FILE)  # [(message_id, text, raw_json)]
     if not all_rows:
         return 0, 0, {t: [] for t in targets}
     rows = [(m, t, r) for (m, t, r) in all_rows if m not in SCHEDULED_LOCK]
@@ -179,7 +170,7 @@ async def publicar(context, *, targets: List[int], mark_as_sent: bool):
     return await publicar_rows(context, rows=rows, targets=targets, mark_as_sent=mark_as_sent)
 
 async def publicar_ids(context, *, ids: List[int], targets: List[int], mark_as_sent: bool):
-    from database import _conn
+    from database import _conn  # para query ad-hoc
     if not ids:
         return 0, 0, {t: [] for t in targets}
     placeholders = ",".join("?" for _ in ids)
