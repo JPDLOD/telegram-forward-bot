@@ -6,19 +6,19 @@
 #
 # Comandos en el canal BORRADOR:
 #   /listar
-#   /cancelar <id>       ← quita de la cola sin borrar el mensaje del canal (también desbloquea si estaba programado)
-#   /deshacer [id]       ← revierte un /cancelar (o responde)
-#   /eliminar <id>       ← BORRA del canal y lo quita de la cola  [alias: /del, /delete, /remove, /borrar]
-#   /nuke <…>            ← all/todos | 1,3,5 | 1-10 | N(últimos)
-#   /enviar              ← envía AHORA a targets activos (principal + backup si ON)
-#   /preview             ← envía la cola a PREVIEW sin marcar como enviada
-#   /programar YYYY-MM-DD HH:MM  ← programa LO QUE HAY EN /listar (snapshot; no se mezcla con lo nuevo)
-#   /programados         ← muestra programaciones pendientes y cuánto falta
-#   /desprogramar <id|all> ← cancela una programación por id o todas
-#   /id [id]             ← info del mensaje/ID; si respondes a un mensaje, te dice su ID
-#   /canales             ← IDs + estado de targets (alias: /targets, /where)
-#   /backup on|off       ← alterna SOLO el backup (principal siempre ON)
-#   /comandos            ← panel con botones (alias: /comando, /ayuda, /start)
+#   /cancelar <id>  (o responde con /cancelar)  ← quita de la cola sin borrar el mensaje del canal
+#   /deshacer [id]  (o responde)                ← revierte un /cancelar
+#   /eliminar <id>  (alias: /del, /delete, /remove, /borrar)  ← BORRA del canal y lo quita de la cola
+#   /nuke <…>       ← ver ayuda en /comandos (all/todos, 1,3,5, 1-10, N últimos)
+#   /enviar         ← envía ahora a targets activos
+#   /preview        ← envía la cola a PREVIEW sin marcar como enviada
+#   /programar YYYY-MM-DD HH:MM  ← programa LO QUE HAY EN /listar (y no se mezcla con lo nuevo)
+#   /programados    ← muestra programaciones pendientes y cuánto falta
+#   /desprogramar <id|all>  ← cancela una programación por id o todas
+#   /id [id]        ← info del mensaje/ID; si respondes a un mensaje, te dice su ID
+#   /canales        ← IDs + estado de targets (alias: /targets, /where)
+#   /backup on|off  ← alterna SOLO el backup (principal siempre ON)
+#   /comandos (alias: /comando, /ayuda, /start)
 #
 # NOTA: Los mensajes que empiecen por "/" NO se guardan como borradores.
 
@@ -92,7 +92,7 @@ _STATS = {"cancelados": 0, "eliminados": 0}
 _SCHEDULED_LOCK: Set[int] = set()
 
 # ========= REGISTRO DE PROGRAMACIONES =========
-# {pid: {"when": datetime, "ids": [...], "rows": [(id,text,raw)], "job": Job}}
+# Guardamos programaciones pendientes: {pid: {"when": datetime, "ids": [...], "job": Job}}
 _SCHEDULES: Dict[int, Dict] = {}
 _SCHED_SEQ: int = 0
 
@@ -311,8 +311,18 @@ def _human_eta(target_dt: datetime, now: Optional[datetime] = None) -> str:
     return f"en {days} d"
 
 
+def _maybe_delete_command(update: Update):
+    """Borra el mensaje del comando (para mantener limpio el canal)."""
+    try:
+        if update and update.channel_post:
+            # Best-effort; el bot necesita permiso para borrar en el canal.
+            update.get_bot().delete_message(chat_id=SOURCE_CHAT_ID, message_id=update.channel_post.message_id)
+    except Exception:
+        pass
+
+
 # -------------------------------------------------------
-# Publicar borradores
+# Publicar borradores: seleccionados o todos (excluyendo bloqueados)
 # -------------------------------------------------------
 async def _publicar_rows(context: ContextTypes.DEFAULT_TYPE, *, rows: List[Tuple[int, str, str]], targets: List[int], mark_as_sent: bool) -> Tuple[int, int, Dict[int, List[int]]]:
     publicados = 0
@@ -359,7 +369,8 @@ async def _publicar_rows(context: ContextTypes.DEFAULT_TYPE, *, rows: List[Tuple
 
 
 async def _publicar(context: ContextTypes.DEFAULT_TYPE, *, targets: List[int], mark_as_sent: bool) -> Tuple[int, int, Dict[int, List[int]]]:
-    all_rows = get_unsent_drafts(DB_FILE)
+    """Envía la cola completa EXCLUYENDO los bloqueados (_SCHEDULED_LOCK)."""
+    all_rows = get_unsent_drafts(DB_FILE)  # [(message_id, text, raw_json)]
     if not all_rows:
         return 0, 0, {t: [] for t in targets}
     rows = [(m, t, r) for (m, t, r) in all_rows if m not in _SCHEDULED_LOCK]
@@ -368,10 +379,11 @@ async def _publicar(context: ContextTypes.DEFAULT_TYPE, *, targets: List[int], m
     return await _publicar_rows(context, rows=rows, targets=targets, mark_as_sent=mark_as_sent)
 
 
-async def _publicar_ids_snapshot(context: ContextTypes.DEFAULT_TYPE, *, rows_snapshot: List[Tuple[int, str, str]], targets: List[int], mark_as_sent: bool) -> Tuple[int, int, Dict[int, List[int]]]:
-    if not rows_snapshot:
+async def _publicar_ids(context: ContextTypes.DEFAULT_TYPE, *, ids: List[int], targets: List[int], mark_as_sent: bool) -> Tuple[int, int, Dict[int, List[int]]]:
+    rows = _get_rows_by_ids(DB_FILE, ids)
+    if not rows:
         return 0, 0, {t: [] for t in targets}
-    return await _publicar_rows(context, rows=rows_snapshot, targets=targets, mark_as_sent=mark_as_sent)
+    return await _publicar_rows(context, rows=rows, targets=targets, mark_as_sent=mark_as_sent)
 
 
 async def _publicar_todo_activos(context: ContextTypes.DEFAULT_TYPE) -> Tuple[int, int]:
@@ -401,33 +413,52 @@ def _deep_link_for_channel_message(chat_id: int, mid: int) -> str:
     return f"https://t.me/c/{cid}/{mid}"
 
 
+def _parse_when_from_text(s: str) -> Optional[datetime]:
+    """
+    Extrae 'YYYY-MM-DD HH:MM' de un texto que puede tener cosas extra (p.ej. '(24h)').
+    Valida 24h (00-23).
+    """
+    if not s:
+        return None
+    m = re.search(r'(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})', s)
+    if not m:
+        return None
+    yyyy_mm_dd, hh, mm = m.group(1), m.group(2), m.group(3)
+    try:
+        h = int(hh)
+        mnt = int(mm)
+        if not (0 <= h <= 23 and 0 <= mnt <= 59):
+            return None
+        hh = f"{h:02d}"
+        when = datetime.strptime(f"{yyyy_mm_dd} {hh}:{mm}", "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+        return when
+    except Exception:
+        return None
+
+
 async def _cmd_listar(context: ContextTypes.DEFAULT_TYPE):
     drafts = list_drafts(DB_FILE)  # [(id, text)]
     lines = []
-    if drafts:
+    if not drafts:
+        lines.append("📋 Borradores pendientes: 0")
+    else:
         lines.append("📋 Borradores pendientes:")
         for i, (did, snip) in enumerate(drafts, start=1):
             s = (snip or "").strip()
             if len(s) > 60:
                 s = s[:60] + "…"
-            tag = ""
-            for pid, rec in _SCHEDULES.items():
-                if did in rec.get("ids", []):
-                    tag = f" (prog:#{pid})"
-                    break
-            lines.append(f"• {i:>2} — {s or '[contenido]'}  (id:{did}){tag}")
-    else:
-        lines.append("📁 No hay borradores.")
+            lines.append(f"• {i:>2} — {s or '[contenido]'}  (id:{did})")
 
-    if _SCHEDULES:
+    # Añadir programaciones
+    if not _SCHEDULES:
+        lines.append("\n📑 Programaciones pendientes: 0")
+    else:
+        lines.append("\n📑 Programaciones pendientes:")
         now = datetime.now(tz=TZ)
-        lines.append("\n🗒 Programaciones pendientes:")
         for pid, rec in sorted(_SCHEDULES.items()):
             when = rec["when"]
             eta = _human_eta(when, now)
             lines.append(f"• #{pid} — {when.astimezone(TZ):%Y-%m-%d %H:%M} ({TZNAME}) — {eta} — {len(rec['ids'])} mensajes")
-    else:
-        lines.append("\n🗒 Programaciones pendientes: 0")
 
     await context.bot.send_message(SOURCE_CHAT_ID, "\n".join(lines))
 
@@ -438,12 +469,14 @@ async def _cmd_cancelar(update: Update, context: ContextTypes.DEFAULT_TYPE, txt:
         mid = update.channel_post.reply_to_message.message_id
     if not mid:
         await context.bot.send_message(SOURCE_CHAT_ID, "❌ Usa: /cancelar <id> o responde al mensaje a cancelar.")
+        _maybe_delete_command(update)
         return
     mark_deleted(DB_FILE, mid)
     _SCHEDULED_LOCK.discard(mid)
     _STATS["cancelados"] += 1
     restantes = len(list_drafts(DB_FILE))
     await _temp_notice(context, f"🚫 Cancelado id:{mid}. Quedan {restantes} en la cola.", ttl=6)
+    _maybe_delete_command(update)
 
 
 async def _cmd_eliminar(update: Update, context: ContextTypes.DEFAULT_TYPE, txt: str):
@@ -452,6 +485,7 @@ async def _cmd_eliminar(update: Update, context: ContextTypes.DEFAULT_TYPE, txt:
         mid = update.channel_post.reply_to_message.message_id
     if not mid:
         await context.bot.send_message(SOURCE_CHAT_ID, "❌ Usa: /eliminar <id> o responde al mensaje a eliminar.")
+        _maybe_delete_command(update)
         return
 
     ok_del = True
@@ -467,6 +501,7 @@ async def _cmd_eliminar(update: Update, context: ContextTypes.DEFAULT_TYPE, txt:
     restantes = len(list_drafts(DB_FILE))
     txt_ok = "🗑️ Eliminado del canal y de la cola." if ok_del else "🗑️ Quitado de la cola (no pude borrar en el canal)."
     await _temp_notice(context, f"{txt_ok} id:{mid}. Quedan {restantes} en la cola.", ttl=7)
+    _maybe_delete_command(update)
 
 
 async def _cmd_deshacer(update: Update, context: ContextTypes.DEFAULT_TYPE, txt: str):
@@ -478,6 +513,7 @@ async def _cmd_deshacer(update: Update, context: ContextTypes.DEFAULT_TYPE, txt:
 
     if not mid:
         await _temp_notice(context, "ℹ️ No hay nada para deshacer.", ttl=5)
+        _maybe_delete_command(update)
         return
 
     restore_draft(DB_FILE, mid)
@@ -485,34 +521,31 @@ async def _cmd_deshacer(update: Update, context: ContextTypes.DEFAULT_TYPE, txt:
         _STATS["cancelados"] -= 1
     restantes = len(list_drafts(DB_FILE))
     await _temp_notice(context, f"↩️ Restaurado id:{mid}. Ahora hay {restantes} en la cola.", ttl=6)
+    _maybe_delete_command(update)
 
 
 # ========== PROGRAMAR ==========
 async def _schedule_ids(context: ContextTypes.DEFAULT_TYPE, when_dt: datetime, ids: List[int]):
-    """Programa el envío de esos IDs exactos (snapshot). Bloquea esos IDs hasta que se ejecute."""
+    """Programa el envío de esos IDs exactos. Bloquea esos IDs hasta que se ejecute."""
     if not ids:
         await _temp_notice(context, "📭 No hay borradores para programar.", ttl=6)
         return
 
-    rows_snapshot = _get_rows_by_ids(DB_FILE, ids)
-    if not rows_snapshot:
-        await _temp_notice(context, "📭 Nada programable (vacío).", ttl=5)
-        return
-
+    # bloquear
     _SCHEDULED_LOCK.update(ids)
 
+    # registrar
     global _SCHED_SEQ
     _SCHED_SEQ += 1
     pid = _SCHED_SEQ
-    rec = {"when": when_dt, "ids": list(ids), "rows": list(rows_snapshot), "job": None}
+    rec = {"when": when_dt, "ids": list(ids), "job": None}
     _SCHEDULES[pid] = rec
 
     async def job(ctx: ContextTypes.DEFAULT_TYPE):
         try:
-            pubs, fails, _posted = await _publicar_ids_snapshot(
-                ctx, rows_snapshot=rows_snapshot, targets=get_active_targets(), mark_as_sent=True
-            )
+            pubs, fails, _posted = await _publicar_ids(ctx, ids=ids, targets=get_active_targets(), mark_as_sent=True)
         finally:
+            # desbloquear y limpiar registro
             for i in ids:
                 _SCHEDULED_LOCK.discard(i)
             _SCHEDULES.pop(pid, None)
@@ -539,6 +572,7 @@ async def _schedule_ids(context: ContextTypes.DEFAULT_TYPE, when_dt: datetime, i
             "❌ No pude programar. Falta JobQueue. Asegúrate de usar `python-telegram-bot[job-queue]`.",
             parse_mode="Markdown",
         )
+        # revertir bloqueo si no hay job queue
         for i in ids:
             _SCHEDULED_LOCK.discard(i)
         _SCHEDULES.pop(pid, None)
@@ -554,15 +588,15 @@ async def _schedule_ids(context: ContextTypes.DEFAULT_TYPE, when_dt: datetime, i
 
 
 async def _cmd_programar(context: ContextTypes.DEFAULT_TYPE, when_str: str):
-    try:
-        when = datetime.strptime(when_str, "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
-    except Exception:
+    when = _parse_when_from_text(when_str)
+    if when is None:
         await context.bot.send_message(
             SOURCE_CHAT_ID,
-            "❌ Formato inválido. Usa: /programar YYYY-MM-DD HH:MM  (formato 24 h)"
+            "❌ Formato inválido. Usa: /programar YYYY-MM-DD HH:MM  (formato 24h)"
         )
         return
 
+    # capturamos los IDs ACTUALES
     ids = [did for (did, _snip) in list_drafts(DB_FILE)]
     await _schedule_ids(context, when, ids)
 
@@ -624,11 +658,13 @@ async def _cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE, txt: str):
     if update.channel_post and update.channel_post.reply_to_message and len((txt or "").split()) == 1:
         rid = update.channel_post.reply_to_message.message_id
         await context.bot.send_message(SOURCE_CHAT_ID, f"🆔 ID del mensaje: {rid}")
+        _maybe_delete_command(update)
         return
 
     mid = _extract_id_from_text(txt) or (txt.split()[1] if len(txt.split()) > 1 and txt.split()[1].isdigit() else None)
     if not mid:
         await context.bot.send_message(SOURCE_CHAT_ID, "Usa: /id <id> o responde a un mensaje con /id.")
+        _maybe_delete_command(update)
         return
     mid = int(mid)
 
@@ -665,13 +701,12 @@ async def _cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE, txt: str):
     link = _deep_link_for_channel_message(SOURCE_CHAT_ID, mid)
     out = f"🆔 {mid}\n• Tipo: {tipo}\n• Snippet: {snippet}\n• Fecha: {fecha}\n• Enlace: {link}"
     await context.bot.send_message(SOURCE_CHAT_ID, out)
+    _maybe_delete_command(update)
 
 
 # ---------- NUKE ----------
 def _parse_nuke_selection(arg: str, drafts: List[Tuple[int, str]]) -> Set[int]:
     arg = (arg or "").strip().lower()
-    # normalizar comas con/ sin espacios
-    arg = ",".join([p.strip() for p in arg.split(",")])
     ids_in_order = [did for (did, _snip) in drafts]
     result: Set[int] = set()
 
@@ -686,6 +721,7 @@ def _parse_nuke_selection(arg: str, drafts: List[Tuple[int, str]]) -> Set[int]:
             result.update(ids_in_order[-n:])
         return result
 
+    # Soporta "1,2,3" y "1, 2, 3"
     pieces = [p.strip() for p in arg.split(",") if p.strip()]
     for p in pieces:
         if re.fullmatch(r"\d+-\d+", p):
@@ -755,18 +791,19 @@ def _kb_main() -> InlineKeyboardMarkup:
 def _text_main() -> str:
     return (
         "🛠️ Comandos:\n"
-        "• /listar — muestra borradores pendientes y programaciones\n"
+        "• /listar — muestra borradores pendientes\n"
         "• /cancelar <id> — o responde con /cancelar (no borra del canal)\n"
         "• /deshacer [id] — revierte un /cancelar (o responde)\n"
         "• /eliminar <id> — o responde (BORRA del canal y de la cola)  [alias: /del]\n"
         "• /nuke all|todos | /nuke 1,3,5 | /nuke 1-10 | /nuke N(últimos)\n"
-        "• /enviar — publica ahora (targets activos)\n"
+        "• /enviar — publica ahora (a targets activos)\n"
         "• /preview — manda la cola a PREVIEW sin marcar como enviada\n"
-        "• /programar YYYY-MM-DD HH:MM — programa snapshot de /listar (24 h)\n"
+        "• /programar YYYY-MM-DD HH:MM — programa el envío (formato 24h)\n"
         "• /programados — ver pendientes programados · /desprogramar <id|all>\n"
         "• /id [id] — info del mensaje o, si respondes, te dice el ID\n"
         "• /canales — IDs + estado de targets (alias: /targets, /where)\n"
-        "• /backup on|off — alterna el backup\n"
+        "• /backup on|off — alterna el backup\n\n"
+        "Pulsa un botón o usa /comandos para volver a ver este panel."
     )
 
 def _kb_settings() -> InlineKeyboardMarkup:
@@ -805,7 +842,7 @@ def _kb_schedule() -> InlineKeyboardMarkup:
 def _text_schedule() -> str:
     return (
         "⏰ Programar envío de **los borradores actuales**.\n"
-        "Elige un atajo o usa `/programar YYYY-MM-DD HH:MM` (formato 24 h).\n"
+        "Elige un atajo o usa `/programar YYYY-MM-DD HH:MM` (formato 24h, sin texto extra).\n"
         "⚠️ Si no hay borradores, no se programa nada."
     )
 
@@ -828,6 +865,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     data = q.data or ""
     try:
+        # Menú principal
         if data == "m:list":
             await _cmd_listar(context)
         elif data == "m:send":
@@ -861,6 +899,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data == "m:back":
             await q.edit_message_text(_text_main(), reply_markup=_kb_main())
 
+        # Programación rápida
         elif data.startswith("s:"):
             now = datetime.now(tz=TZ)
             when = None
@@ -880,11 +919,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await _cmd_desprogramar(context, "all")
             elif data == "s:custom":
                 await q.edit_message_text(
-                    "✍️ Formato manual:\n`/programar YYYY-MM-DD HH:MM` (24 h)\n\n⬅️ Usa *Volver* para regresar.",
+                    "✍️ Formato manual:\n`/programar YYYY-MM-DD HH:MM`  (formato 24h, sin texto extra)\n\n⬅️ Usa *Volver* para regresar.",
                     parse_mode="Markdown", reply_markup=_kb_schedule()
                 )
 
             if when:
+                # IDs actuales
                 ids = [did for (did, _snip) in list_drafts(DB_FILE)]
                 if not ids:
                     await _temp_notice(context, "📭 No hay borradores para programar.", ttl=6)
@@ -940,7 +980,7 @@ async def handle_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         low = txt.lower()
 
         if low.startswith("/listar") or low.startswith("/lista"):
-            await _cmd_listar(context);  return
+            await _cmd_listar(context);  _maybe_delete_command(update);  return
 
         if low.startswith(("/cancelar", "/cancel", "/skip")):
             await _cmd_cancelar(update, context, txt);  return
@@ -952,9 +992,9 @@ async def handle_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _cmd_deshacer(update, context, txt);  return
 
         if low.startswith("/nuke"):
-            await _cmd_nuke(context, txt);  return
+            await _cmd_nuke(context, txt);  _maybe_delete_command(update);  return
         if low.strip() in ("/all", "/todos"):
-            await _cmd_nuke(context, "/nuke all");  return
+            await _cmd_nuke(context, "/nuke all");  _maybe_delete_command(update);  return
 
         if low.startswith("/enviar"):
             await _temp_notice(context, "⏳ Procesando envío…", ttl=4)
@@ -972,43 +1012,43 @@ async def handle_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(SOURCE_CHAT_ID, msg_out)
             _STATS["cancelados"] = 0
             _STATS["eliminados"] = 0
+            _maybe_delete_command(update)
             return
 
         if low.startswith("/preview"):
-            await _cmd_preview(context);  return
+            await _cmd_preview(context);  _maybe_delete_command(update);  return
 
         if low.startswith("/programar"):
             parts = txt.split(maxsplit=2)
-            if len(parts) >= 3:
-                when_str = f"{parts[1]} {parts[2]}"
-                await _cmd_programar(context, when_str)
-            else:
-                await context.bot.send_message(SOURCE_CHAT_ID, "Usa: /programar YYYY-MM-DD HH:MM  (24 h)")
+            when_str = parts[1] + " " + parts[2] if len(parts) >= 3 else ""
+            await _cmd_programar(context, when_str)
+            _maybe_delete_command(update)
             return
 
         if low.startswith("/programados"):
-            await _cmd_programados(context);  return
+            await _cmd_programados(context);  _maybe_delete_command(update);  return
 
         if low.startswith("/desprogramar"):
             parts = txt.split(maxsplit=1)
             arg = parts[1] if len(parts) > 1 else ""
-            await _cmd_desprogramar(context, arg);  return
+            await _cmd_desprogramar(context, arg);  _maybe_delete_command(update);  return
 
         if low.startswith("/id"):
             await _cmd_id(update, context, txt);  return
 
         if low.startswith(("/canales", "/targets", "/where")):
-            await _cmd_canales(context);  return
+            await _cmd_canales(context);  _maybe_delete_command(update);  return
 
         if low.startswith("/backup"):
             parts = txt.split(maxsplit=1)
             arg = parts[1] if len(parts) > 1 else ""
-            await _cmd_backup(context, arg);  return
+            await _cmd_backup(context, arg);  _maybe_delete_command(update);  return
 
         if low.startswith(("/comandos", "/comando", "/ayuda", "/start")):
-            await _send_help_with_buttons(context);  return
+            await _send_help_with_buttons(context);  _maybe_delete_command(update);  return
 
         await context.bot.send_message(SOURCE_CHAT_ID, "Comando no reconocido. Usa /comandos.")
+        _maybe_delete_command(update)
         return
 
     # --------- BORRADOR ----------
