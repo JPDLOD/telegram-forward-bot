@@ -11,11 +11,11 @@ from database import get_unsent_drafts, mark_sent
 
 logger = logging.getLogger(__name__)
 
-# ========= Estado de targets (visible para otros módulos) =========
+# ========= Estado de targets =========
 ACTIVE_BACKUP: bool = True  # por defecto ON
 
 def is_active_backup() -> bool:
-    """Lee el estado actual del backup."""
+    """Lee el estado actual del backup (True/False)."""
     return ACTIVE_BACKUP
 
 def set_active_backup(value: bool) -> None:
@@ -29,7 +29,7 @@ def get_active_targets() -> List[int]:
         targets.append(BACKUP_CHAT_ID)
     return targets
 
-# ========= Contadores / locks que usan otros módulos =========
+# ========= Contadores / locks (usados por otros módulos) =========
 STATS = {"cancelados": 0, "eliminados": 0}
 SCHEDULED_LOCK: Set[int] = set()
 
@@ -51,8 +51,7 @@ async def _send_with_backoff(func_coro_factory, *, base_pause: float):
                 wait = int(m.group(1)) if m else 3
             logger.warning(f"RetryAfter: esperando {wait}s …")
             import asyncio
-            await asyncio.sleep(wait + 1.0)
-            tries += 1
+            await asyncio.sleep(wait + 1.0);  tries += 1
         except TimedOut:
             logger.warning("TimedOut: esperando 3s …")
             import asyncio
@@ -63,6 +62,7 @@ async def _send_with_backoff(func_coro_factory, *, base_pause: float):
             await asyncio.sleep(3.0);  tries += 1
         except TelegramError as e:
             if "Flood control exceeded" in str(e):
+                logger.warning("Flood control… esperando 5s …")
                 import asyncio
                 await asyncio.sleep(5.0);  tries += 1
             else:
@@ -171,7 +171,7 @@ async def _publicar_rows(context: ContextTypes.DEFAULT_TYPE, *, rows: List[Tuple
 
 async def publicar(context: ContextTypes.DEFAULT_TYPE, *, targets: List[int], mark_as_sent: bool):
     """Envía la cola completa EXCLUYENDO los bloqueados (SCHEDULED_LOCK)."""
-    all_rows = get_unsent_drafts(DB_FILE)
+    all_rows = get_unsent_drafts(DB_FILE)  # [(message_id, text, raw_json)]
     if not all_rows:
         return 0, 0, {t: [] for t in targets}
     rows = [(m, t, r) for (m, t, r) in all_rows if m not in SCHEDULED_LOCK]
@@ -181,6 +181,7 @@ async def publicar(context: ContextTypes.DEFAULT_TYPE, *, targets: List[int], ma
 
 async def publicar_ids(context: ContextTypes.DEFAULT_TYPE, *, ids: List[int],
                        targets: List[int], mark_as_sent: bool):
+    # Query puntual sin duplicar lógica del módulo database
     import sqlite3
     if not ids:
         return 0, 0, {t: [] for t in targets}
