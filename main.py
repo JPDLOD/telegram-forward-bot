@@ -10,10 +10,11 @@
 #   /deshacer [id]  (o responde)                ← revierte un /cancelar
 #   /eliminar <id>  (alias: /del, /delete, /remove, /borrar)  ← BORRA del canal y lo quita de la cola
 #   /nuke <…>       ← ver ayuda en /comandos (all/todos, 1,3,5, 1-10, N últimos)
-#   /enviar
+#   /enviar         ← envía ahora a targets activos
 #   /preview        ← envía la cola a PREVIEW sin marcar como enviada
-#   /undo_send      ← borra en targets el último lote que envió el bot
-#   /programar YYYY-MM-DD HH:MM
+#   /programar YYYY-MM-DD HH:MM  ← programa LO QUE HAY EN /listar (y no se mezcla con lo nuevo)
+#   /programados    ← muestra programaciones pendientes y cuánto falta
+#   /desprogramar <id|all>  ← cancela una programación por id o todas
 #   /id [id]        ← info del mensaje/ID; si respondes a un mensaje, te dice su ID
 #   /canales        ← IDs + estado de targets (alias: /targets, /where)
 #   /backup on|off  ← alterna SOLO el backup (principal siempre ON)
@@ -87,11 +88,13 @@ def get_active_targets() -> List[int]:
 # ========= CONTADORES =========
 _STATS = {"cancelados": 0, "eliminados": 0}
 
-# ========= HISTÓRICO ÚLTIMO LOTE ENVIADO (para /undo_send) =========
-_LAST_BATCH: Dict[int, List[int]] = {}  # {chat_id_destino: [message_ids publicados allá]}
-
 # ========= BLOQUEOS DE PROGRAMACIÓN (IDs programados) =========
 _SCHEDULED_LOCK: Set[int] = set()
+
+# ========= REGISTRO DE PROGRAMACIONES =========
+# Guardamos programaciones pendientes: {pid: {"when": datetime, "ids": [...], "job": Job}}
+_SCHEDULES: Dict[int, Dict] = {}
+_SCHED_SEQ: int = 0
 
 
 # -------------------------------------------------------
@@ -281,11 +284,32 @@ async def _temp_notice(context: ContextTypes.DEFAULT_TYPE, text: str, ttl: int =
         return
     async def _auto_del():
         await _safe_sleep(ttl)
+    #    try:
         try:
             await context.bot.delete_message(SOURCE_CHAT_ID, m.message_id)
         except Exception:
             pass
     asyncio.create_task(_auto_del())
+
+
+def _human_eta(target_dt: datetime, now: Optional[datetime] = None) -> str:
+    """Texto corto tipo 'en 27 min' / 'en 1 h 15 m' / 'en 2 d 3 h'."""
+    now = now or datetime.now(tz=TZ)
+    sec = max(0, int((target_dt - now).total_seconds()))
+    mins = sec // 60
+    if mins < 60:
+        return f"en {mins} min"
+    hours = mins // 60
+    mins = mins % 60
+    if hours < 24:
+        if mins:
+            return f"en {hours} h {mins} m"
+        return f"en {hours} h"
+    days = hours // 24
+    hours = hours % 24
+    if hours:
+        return f"en {days} d {hours} h"
+    return f"en {days} d"
 
 
 # -------------------------------------------------------
@@ -354,9 +378,7 @@ async def _publicar_ids(context: ContextTypes.DEFAULT_TYPE, *, ids: List[int], t
 
 
 async def _publicar_todo_activos(context: ContextTypes.DEFAULT_TYPE) -> Tuple[int, int]:
-    pubs, fails, posted = await _publicar(context, targets=get_active_targets(), mark_as_sent=True)
-    global _LAST_BATCH
-    _LAST_BATCH = posted
+    pubs, fails, _posted = await _publicar(context, targets=get_active_targets(), mark_as_sent=True)
     return pubs, fails
 
 
@@ -457,15 +479,26 @@ async def _schedule_ids(context: ContextTypes.DEFAULT_TYPE, when_dt: datetime, i
     if not ids:
         await _temp_notice(context, "📭 No hay borradores para programar.", ttl=6)
         return
+
+    # bloquear
     _SCHEDULED_LOCK.update(ids)
 
+    # registrar
+    global _SCHED_SEQ
+    _SCHED_SEQ += 1
+    pid = _SCHED_SEQ
+    rec = {"when": when_dt, "ids": list(ids), "job": None}
+    _SCHEDULES[pid] = rec
+
     async def job(ctx: ContextTypes.DEFAULT_TYPE):
-        pubs, fails, posted = await _publicar_ids(ctx, ids=ids, targets=get_active_targets(), mark_as_sent=True)
-        global _LAST_BATCH
-        _LAST_BATCH = posted
-        # desbloquear (por si algo falló y se reintenta manualmente después)
-        for i in ids:
-            _SCHEDULED_LOCK.discard(i)
+        try:
+            pubs, fails, _posted = await _publicar_ids(ctx, ids=ids, targets=get_active_targets(), mark_as_sent=True)
+        finally:
+            # desbloquear y limpiar registro
+            for i in ids:
+                _SCHEDULED_LOCK.discard(i)
+            _SCHEDULES.pop(pid, None)
+
         msg2 = f"⏱️ Programación ejecutada. Publicados {pubs}."
         extra = []
         if _STATS["cancelados"]:
@@ -482,8 +515,25 @@ async def _schedule_ids(context: ContextTypes.DEFAULT_TYPE, when_dt: datetime, i
 
     now = datetime.now(tz=TZ)
     seconds = max(0, int((when_dt - now).total_seconds()))
-    context.job_queue.run_once(lambda ctx: asyncio.create_task(job(ctx)), when=seconds)
-    await context.bot.send_message(SOURCE_CHAT_ID, f"🗓️ Programado para {when_dt.astimezone(TZ):%Y-%m-%d %H:%M} ({TZNAME}).")
+    if not context.job_queue:
+        await context.bot.send_message(
+            SOURCE_CHAT_ID,
+            "❌ No pude programar. Falta JobQueue. Asegúrate de usar `python-telegram-bot[job-queue]`.",
+            parse_mode="Markdown",
+        )
+        # revertir bloqueo si no hay job queue
+        for i in ids:
+            _SCHEDULED_LOCK.discard(i)
+        _SCHEDULES.pop(pid, None)
+        return
+
+    rec["job"] = context.job_queue.run_once(lambda ctx: asyncio.create_task(job(ctx)), when=seconds)
+
+    eta = _human_eta(when_dt)
+    await context.bot.send_message(
+        SOURCE_CHAT_ID,
+        f"🗓️ Programado para {when_dt.astimezone(TZ):%Y-%m-%d %H:%M} ({TZNAME}) — {eta}.  (id prog: {pid})"
+    )
 
 
 async def _cmd_programar(context: ContextTypes.DEFAULT_TYPE, when_str: str):
@@ -496,6 +546,59 @@ async def _cmd_programar(context: ContextTypes.DEFAULT_TYPE, when_str: str):
     # capturamos los IDs ACTUALES
     ids = [did for (did, _snip) in list_drafts(DB_FILE)]
     await _schedule_ids(context, when, ids)
+
+
+async def _cmd_programados(context: ContextTypes.DEFAULT_TYPE):
+    if not _SCHEDULES:
+        await context.bot.send_message(SOURCE_CHAT_ID, "📭 No hay programaciones pendientes.")
+        return
+    now = datetime.now(tz=TZ)
+    lines = ["🗒 Programaciones pendientes:"]
+    for pid, rec in sorted(_SCHEDULES.items()):
+        when = rec["when"]
+        ids = rec["ids"]
+        eta = _human_eta(when, now)
+        lines.append(f"• #{pid} — {when.astimezone(TZ):%Y-%m-%d %H:%M} ({TZNAME}) — {eta} — {len(ids)} mensajes")
+    await context.bot.send_message(SOURCE_CHAT_ID, "\n".join(lines))
+
+
+async def _cmd_desprogramar(context: ContextTypes.DEFAULT_TYPE, arg: str):
+    v = (arg or "").strip().lower()
+    if v in ("all", "todos"):
+        count = 0
+        for pid, rec in list(_SCHEDULES.items()):
+            job = rec.get("job")
+            if job:
+                try:
+                    job.schedule_removal()
+                except Exception:
+                    pass
+            for i in rec.get("ids", []):
+                _SCHEDULED_LOCK.discard(i)
+            _SCHEDULES.pop(pid, None)
+            count += 1
+        await context.bot.send_message(SOURCE_CHAT_ID, f"❌ Canceladas {count} programaciones.")
+        return
+
+    if v.isdigit():
+        pid = int(v)
+        rec = _SCHEDULES.get(pid)
+        if not rec:
+            await context.bot.send_message(SOURCE_CHAT_ID, f"No existe la programación #{pid}.")
+            return
+        job = rec.get("job")
+        if job:
+            try:
+                job.schedule_removal()
+            except Exception:
+                pass
+        for i in rec.get("ids", []):
+            _SCHEDULED_LOCK.discard(i)
+        _SCHEDULES.pop(pid, None)
+        await context.bot.send_message(SOURCE_CHAT_ID, f"❌ Cancelada la programación #{pid}.")
+        return
+
+    await context.bot.send_message(SOURCE_CHAT_ID, "Usa: /desprogramar <id|all>")
 
 
 async def _cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE, txt: str):
@@ -631,16 +734,19 @@ def _kb_main() -> InlineKeyboardMarkup:
 def _text_main() -> str:
     return (
         "🛠️ Acciones rápidas:\n"
-        "• /listar  • /enviar  • /preview  • /programar YYYY-MM-DD HH:MM\n"
-        "• /nuke …  • /cancelar  • /eliminar  • /undo_send  • /id [id]\n"
+        "• /listar — muestra borradores pendientes\n"
+        "• /enviar — publica ahora a targets activos\n"
+        "• /preview — manda la cola a PREVIEW sin marcarla como enviada\n"
+        "• /programar YYYY-MM-DD HH:MM — programa lo que está en /listar (no mezcla con lo nuevo)\n"
+        "• /programados — ver pendientes programados · /desprogramar <id|all>\n"
+        "• /nuke …  • /cancelar  • /eliminar  • /id [id]\n"
         "Pulsa un botón o usa /comandos para volver a ver este panel."
     )
 
 def _kb_settings() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("🔀 Backup ON/OFF", callback_data="m:toggle_backup"),
-             InlineKeyboardButton("ℹ️ Canales", callback_data="m:canales")],
+            [InlineKeyboardButton("🔀 Backup ON/OFF", callback_data="m:toggle_backup")],
             [InlineKeyboardButton("⬅️ Volver", callback_data="m:back")]
         ]
     )
@@ -652,7 +758,7 @@ def _text_settings() -> str:
         f"• Principal: `{TARGET_CHAT_ID}` **ON** (fijo)\n"
         f"• Backup   : `{BACKUP_CHAT_ID}` **{onoff}**\n"
         f"• Preview  : `{PREVIEW_CHAT_ID}`\n\n"
-        "Usa el botón para alternar backup o ver canales.\n"
+        "Usa el botón para alternar backup.\n"
         "⬅️ *Volver* regresa al menú principal."
     )
 
@@ -663,6 +769,8 @@ def _kb_schedule() -> InlineKeyboardMarkup:
              InlineKeyboardButton("⏳ +15 min", callback_data="s:+15")],
             [InlineKeyboardButton("🕗 Hoy 20:00", callback_data="s:today20"),
              InlineKeyboardButton("🌅 Mañana 07:00", callback_data="s:tom07")],
+            [InlineKeyboardButton("🗒 Ver programados", callback_data="s:list"),
+             InlineKeyboardButton("❌ Cancelar todos", callback_data="s:clear")],
             [InlineKeyboardButton("✍️ Custom", callback_data="s:custom"),
              InlineKeyboardButton("⬅️ Volver", callback_data="m:back")]
         ]
@@ -680,7 +788,7 @@ async def _send_help_with_buttons(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(SOURCE_CHAT_ID, _text_main(), reply_markup=_kb_main())
 
 
-async def _send_canales_panel(context: ContextTypes.DEFAULT_TYPE):
+async def _send_settings_panel(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(SOURCE_CHAT_ID, _text_settings(), reply_markup=_kb_settings(), parse_mode="Markdown")
 
 
@@ -721,8 +829,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(_text_schedule(), reply_markup=_kb_schedule())
         elif data == "m:settings":
             await q.edit_message_text(_text_settings(), reply_markup=_kb_settings(), parse_mode="Markdown")
-        elif data == "m:canales":
-            await q.edit_message_text(_text_settings(), reply_markup=_kb_settings(), parse_mode="Markdown")
         elif data == "m:toggle_backup":
             global _ACTIVE_BACKUP
             _ACTIVE_BACKUP = not _ACTIVE_BACKUP
@@ -744,6 +850,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     when = when + timedelta(days=1)
             elif data == "s:tom07":
                 when = (now + timedelta(days=1)).replace(hour=7, minute=0, second=0, microsecond=0)
+            elif data == "s:list":
+                await _cmd_programados(context)
+            elif data == "s:clear":
+                await _cmd_desprogramar(context, "all")
             elif data == "s:custom":
                 await q.edit_message_text(
                     "✍️ Formato manual:\n`/programar YYYY-MM-DD HH:MM`\n\n⬅️ Usa *Volver* para regresar.",
@@ -763,30 +873,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # -------------------------------------------------------
-# Comandos adicionales: /preview, /undo_send, /canales, /backup
+# Comandos adicionales
 # -------------------------------------------------------
 async def _cmd_preview(context: ContextTypes.DEFAULT_TYPE):
     await _temp_notice(context, "⏳ Generando preview…", ttl=3)
     pubs, fails, _ = await _publicar(context, targets=[PREVIEW_CHAT_ID], mark_as_sent=False)
     await context.bot.send_message(SOURCE_CHAT_ID, f"🧪 Preview: enviados {pubs}, fallidos {fails}.")
 
-async def _cmd_undo_send(context: ContextTypes.DEFAULT_TYPE):
-    if not _LAST_BATCH:
-        await _temp_notice(context, "No hay lote previo para deshacer.", ttl=5)
-        return
-    removed_total = 0
-    for dest, mids in _LAST_BATCH.items():
-        for mid in reversed(mids):
-            try:
-                await context.bot.delete_message(chat_id=dest, message_id=mid)
-                removed_total += 1
-            except TelegramError as e:
-                logger.warning(f"No pude borrar en {dest} mid:{mid} → {e}")
-    _LAST_BATCH.clear()
-    await context.bot.send_message(SOURCE_CHAT_ID, f"↩️ Undo send: {removed_total} mensajes borrados en los targets.")
-
 async def _cmd_canales(context: ContextTypes.DEFAULT_TYPE):
-    await _send_canales_panel(context)
+    await _send_settings_panel(context)
 
 async def _cmd_backup(context: ContextTypes.DEFAULT_TYPE, arg: str):
     global _ACTIVE_BACKUP
@@ -798,7 +893,7 @@ async def _cmd_backup(context: ContextTypes.DEFAULT_TYPE, arg: str):
     else:
         await context.bot.send_message(SOURCE_CHAT_ID, "Usa: /backup on|off")
         return
-    await _send_canales_panel(context)
+    await _send_settings_panel(context)
 
 
 def _is_command_text(txt: Optional[str]) -> bool:
@@ -859,9 +954,6 @@ async def handle_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if low.startswith("/preview"):
             await _cmd_preview(context);  return
 
-        if low.startswith("/undo_send"):
-            await _cmd_undo_send(context);  return
-
         if low.startswith("/programar"):
             parts = txt.split(maxsplit=2)
             if len(parts) >= 3:
@@ -870,6 +962,14 @@ async def handle_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await context.bot.send_message(SOURCE_CHAT_ID, "Usa: /programar YYYY-MM-DD HH:MM")
             return
+
+        if low.startswith("/programados"):
+            await _cmd_programados(context);  return
+
+        if low.startswith("/desprogramar"):
+            parts = txt.split(maxsplit=1)
+            arg = parts[1] if len(parts) > 1 else ""
+            await _cmd_desprogramar(context, arg);  return
 
         if low.startswith("/id"):
             await _cmd_id(update, context, txt);  return
