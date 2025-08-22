@@ -42,7 +42,9 @@ def save_draft(path: str, message_id: int, snippet: str, raw_json: str):
 def get_unsent_drafts(path: str) -> List[Tuple[int, str, str]]:
     c = _conn(path)
     cur = c.execute(
-        "SELECT message_id, snippet, raw_json FROM drafts WHERE sent=0 AND deleted=0 ORDER BY message_id ASC"
+        "SELECT message_id, snippet, raw_json FROM drafts "
+        "WHERE sent=0 AND deleted=0 "
+        "ORDER BY created_at ASC"
     )
     return list(cur.fetchall())
 
@@ -57,7 +59,9 @@ def mark_sent(path: str, ids: List[int]):
 def list_drafts(path: str) -> List[Tuple[int, str]]:
     c = _conn(path)
     cur = c.execute(
-        "SELECT message_id, COALESCE(snippet,'') FROM drafts WHERE sent=0 AND deleted=0 ORDER BY message_id ASC"
+        "SELECT message_id, COALESCE(snippet,'') FROM drafts "
+        "WHERE sent=0 AND deleted=0 "
+        "ORDER BY created_at ASC"
     )
     return list(cur.fetchall())
 
@@ -74,7 +78,9 @@ def restore_draft(path: str, message_id: int):
 def get_last_deleted(path: str) -> Optional[int]:
     c = _conn(path)
     cur = c.execute(
-        "SELECT message_id FROM drafts WHERE sent=0 AND deleted=1 ORDER BY message_id DESC LIMIT 1"
+        "SELECT message_id FROM drafts "
+        "WHERE sent=0 AND deleted=1 "
+        "ORDER BY message_id DESC LIMIT 1"
     )
     row = cur.fetchone()
     return int(row[0]) if row else None
