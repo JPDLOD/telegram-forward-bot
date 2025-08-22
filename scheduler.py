@@ -1,52 +1,23 @@
 # -*- coding: utf-8 -*-
-from __future__ import annotations
-
-import asyncio
+import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from telegram.ext import ContextTypes
+from config import TZ, TZNAME, SOURCE_CHAT_ID
+from utils import human_eta
+from publisher import publicar_ids, get_active_targets, STATS, SCHEDULED_LOCK
 
-from config import TZ, TZNAME
-from database import list_drafts
-from core_utils import human_eta, temp_notice
-from publisher import (
-    publicar_ids, get_active_targets, STATS, SCHEDULED_LOCK, LAST_BATCH
-)
+logger = logging.getLogger(__name__)
 
-# ======= registro de programaciones (en memoria) =======
-# {pid: {"when": datetime, "ids": [...], "job": Job}}
+# REGISTRO EN MEMORIA: {pid: {"when": datetime, "ids": [...], "job": Job}}
 SCHEDULES: Dict[int, Dict] = {}
 SCHED_SEQ: int = 0
-
-
-def _parse_datetime_str(s: str) -> Optional[datetime]:
-    """
-    Acepta 'YYYY-MM-DD HH:MM' con HH de 0..23.
-    Ignora texto extra al final (p.ej. '(24 h)').
-    Acepta '1:27' o '01:27'.
-    """
-    parts = s.strip().split()
-    if len(parts) < 2:
-        return None
-    date_str = parts[0]
-    time_raw = parts[1]
-    # normaliza hora 1:27 -> 01:27
-    if ":" in time_raw:
-        hh, mm = time_raw.split(":", 1)
-        if hh.isdigit() and len(hh) == 1:
-            time_raw = f"0{hh}:{mm}"
-    try:
-        dt = datetime.strptime(f"{date_str} {time_raw}", "%Y-%m-%d %H:%M")
-        return dt.replace(tzinfo=TZ)
-    except Exception:
-        return None
-
 
 async def schedule_ids(context: ContextTypes.DEFAULT_TYPE, when_dt: datetime, ids: List[int]):
     """Programa el envío de esos IDs exactos. Bloquea esos IDs hasta que se ejecute."""
     if not ids:
-        await temp_notice(context, "📭 No hay borradores para programar.", ttl=6)
+        await context.bot.send_message(SOURCE_CHAT_ID, "📭 No hay borradores para programar.")
         return
 
     # bloquear
@@ -60,78 +31,79 @@ async def schedule_ids(context: ContextTypes.DEFAULT_TYPE, when_dt: datetime, id
     SCHEDULES[pid] = rec
 
     async def job(ctx: ContextTypes.DEFAULT_TYPE):
-        pubs, fails, posted = 0, 0, {}
         try:
-            pubs, fails, posted = await publicar_ids(ctx, ids=ids, mark_as_sent=True)
+            pubs, fails, _posted = await publicar_ids(ctx, ids=ids, targets=get_active_targets(), mark_as_sent=True)
+            msg2 = f"⏱️ Programación ejecutada. Publicados {pubs}."
+            extra = []
+            if STATS["cancelados"]:
+                extra.append(f"Cancelados: {STATS['cancelados']}")
+            if STATS["eliminados"]:
+                extra.append(f"Eliminados: {STATS['eliminados']}")
+            if fails:
+                extra.append(f"Fallidos: {fails}")
+            if extra:
+                msg2 += " " + " · ".join(extra) + "."
+            await ctx.bot.send_message(SOURCE_CHAT_ID, msg2)
+            STATS["cancelados"] = 0
+            STATS["eliminados"] = 0
+        except Exception as e:
+            logger.exception(f"Error en job programado: {e}")
+            await ctx.bot.send_message(SOURCE_CHAT_ID, "❌ Error ejecutando la programación (revisa logs).")
         finally:
             # desbloquear y limpiar registro
             for i in ids:
                 SCHEDULED_LOCK.discard(i)
             SCHEDULES.pop(pid, None)
 
-        # guarda lote para /undo_send si se decide reactivar en el futuro
-        # (dejamos la variable LAST_BATCH intacta si se usa en otro lugar)
-        from publisher import LAST_BATCH as _LB
-        _LB.update(posted)
-
-        msg2 = f"⏱️ Programación ejecutada. Publicados {pubs}."
-        extra = []
-        if STATS.get("cancelados"):
-            extra.append(f"Cancelados: {STATS['cancelados']}")
-        if STATS.get("eliminados"):
-            extra.append(f"Eliminados: {STATS['eliminados']}")
-        if fails:
-            extra.append(f"Fallidos: {fails}")
-        if extra:
-            msg2 += " " + " · ".join(extra) + "."
-        await ctx.bot.send_message(list_drafts.__defaults__[0] if list_drafts.__defaults__ else None, msg2)  # no usamos
-        # mejor enviamos directo al canal de borradores:
-        from config import SOURCE_CHAT_ID
-        await ctx.bot.send_message(SOURCE_CHAT_ID, msg2)
-        STATS["cancelados"] = 0
-        STATS["eliminados"] = 0
-
     now = datetime.now(tz=TZ)
-    delay = max(0, (when_dt - now).total_seconds())
+    seconds = max(0, int((when_dt - now).total_seconds()))
+    if not context.job_queue:
+        await context.bot.send_message(
+            SOURCE_CHAT_ID,
+            "❌ No pude programar. Falta JobQueue. Asegúrate de usar `python-telegram-bot[job-queue]`.",
+            parse_mode="Markdown",
+        )
+        # revertir bloqueo si no hay job queue
+        for i in ids:
+            SCHEDULED_LOCK.discard(i)
+        SCHEDULES.pop(pid, None)
+        return
 
-    # PTB 21.x admite float (segundos) o datetime.
-    rec["job"] = context.job_queue.run_once(lambda ctx: asyncio.create_task(job(ctx)), when=delay)
+    rec["job"] = context.job_queue.run_once(job, when=seconds)
 
-    eta = human_eta(when_dt, now)
-    from config import SOURCE_CHAT_ID
+    eta = human_eta(when_dt)
     await context.bot.send_message(
         SOURCE_CHAT_ID,
         f"🗓️ Programado para {when_dt.astimezone(TZ):%Y-%m-%d %H:%M} ({TZNAME}) — {eta}.  (id prog: {pid})"
     )
 
-
 async def cmd_programar(context: ContextTypes.DEFAULT_TYPE, when_str: str):
-    when = _parse_datetime_str(when_str)
-    from config import SOURCE_CHAT_ID
-    if not when:
+    from config import DB_FILE
+    from database import list_drafts
+    try:
+        when = datetime.strptime(when_str, "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+    except Exception:
         await context.bot.send_message(
             SOURCE_CHAT_ID,
-            "❌ Formato inválido. Usa: /programar YYYY-MM-DD HH:MM  (formato 24 h)"
+            "❌ Formato inválido. Usa: `/programar YYYY-MM-DD HH:MM` (24h: 00:00–23:59, sin '(24h)' ni AM/PM).",
+            parse_mode="Markdown",
         )
         return
 
-    ids = [did for (did, _snip) in list_drafts.__wrapped__("drafts.db")]  # fallback por si default no está
-    # Mejor: usa la API pública:
-    from database import list_drafts as _list
-    ids = [did for (did, _snip) in _list("drafts.db")]
-
-    # capturamos los IDs ACTUALES
-    from database import list_drafts as list_drafts_real
-    ids = [did for (did, _snip) in list_drafts_real("drafts.db")]
+    # IDs actuales (pendientes y no cancelados)
+    ids = [did for (did, _snip) in list_drafts(DB_FILE)]
+    if not ids:
+        await context.bot.send_message(SOURCE_CHAT_ID, "📭 No hay borradores para programar.")
+        return
     await schedule_ids(context, when, ids)
 
-
 async def cmd_programados(context: ContextTypes.DEFAULT_TYPE):
-    from config import SOURCE_CHAT_ID
+    from config import TZNAME, TZ
     if not SCHEDULES:
         await context.bot.send_message(SOURCE_CHAT_ID, "📭 No hay programaciones pendientes.")
         return
-    now = datetime.now(tz=TZ)
+    from datetime import datetime as _dt
+    now = _dt.now(tz=TZ)
     lines = ["🗒 Programaciones pendientes:"]
     for pid, rec in sorted(SCHEDULES.items()):
         when = rec["when"]
@@ -140,9 +112,7 @@ async def cmd_programados(context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"• #{pid} — {when.astimezone(TZ):%Y-%m-%d %H:%M} ({TZNAME}) — {eta} — {len(ids)} mensajes")
     await context.bot.send_message(SOURCE_CHAT_ID, "\n".join(lines))
 
-
 async def cmd_desprogramar(context: ContextTypes.DEFAULT_TYPE, arg: str):
-    from config import SOURCE_CHAT_ID
     v = (arg or "").strip().lower()
     if v in ("all", "todos"):
         count = 0
