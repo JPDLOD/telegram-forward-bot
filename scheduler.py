@@ -5,7 +5,7 @@ from typing import Dict, List
 
 from telegram.ext import ContextTypes
 from config import TZ, TZNAME, SOURCE_CHAT_ID
-from utils import human_eta
+from core_utils import human_eta
 from publisher import publicar_ids, get_active_targets, STATS, SCHEDULED_LOCK
 
 logger = logging.getLogger(__name__)
@@ -50,7 +50,6 @@ async def schedule_ids(context: ContextTypes.DEFAULT_TYPE, when_dt: datetime, id
             logger.exception(f"Error en job programado: {e}")
             await ctx.bot.send_message(SOURCE_CHAT_ID, "❌ Error ejecutando la programación (revisa logs).")
         finally:
-            # desbloquear y limpiar registro
             for i in ids:
                 SCHEDULED_LOCK.discard(i)
             SCHEDULES.pop(pid, None)
@@ -63,7 +62,6 @@ async def schedule_ids(context: ContextTypes.DEFAULT_TYPE, when_dt: datetime, id
             "❌ No pude programar. Falta JobQueue. Asegúrate de usar `python-telegram-bot[job-queue]`.",
             parse_mode="Markdown",
         )
-        # revertir bloqueo si no hay job queue
         for i in ids:
             SCHEDULED_LOCK.discard(i)
         SCHEDULES.pop(pid, None)
@@ -90,7 +88,6 @@ async def cmd_programar(context: ContextTypes.DEFAULT_TYPE, when_str: str):
         )
         return
 
-    # IDs actuales (pendientes y no cancelados)
     ids = [did for (did, _snip) in list_drafts(DB_FILE)]
     if not ids:
         await context.bot.send_message(SOURCE_CHAT_ID, "📭 No hay borradores para programar.")
@@ -98,7 +95,6 @@ async def cmd_programar(context: ContextTypes.DEFAULT_TYPE, when_str: str):
     await schedule_ids(context, when, ids)
 
 async def cmd_programados(context: ContextTypes.DEFAULT_TYPE):
-    from config import TZNAME, TZ
     if not SCHEDULES:
         await context.bot.send_message(SOURCE_CHAT_ID, "📭 No hay programaciones pendientes.")
         return
