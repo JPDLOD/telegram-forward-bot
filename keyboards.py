@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from config import TARGET_CHAT_ID, BACKUP_CHAT_ID, PREVIEW_CHAT_ID
-from publisher import is_active_backup
+from publisher import ACTIVE_BACKUP
 
 def kb_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -15,9 +15,9 @@ def kb_main() -> InlineKeyboardMarkup:
     )
 
 def text_main() -> str:
-    # Texto completo, sin abreviar (como tu captura)
+    # LISTA LARGA (sin resumen), igual a tu captura
     return (
-        "🛠️ Comandos:\n"
+        "🛠️  Comandos:\n"
         "• /listar — muestra borradores pendientes (excluye los programados)\n"
         "• /cancelar <id> — o responde con /cancelar (quita de la cola sin borrar del canal)\n"
         "• /deshacer [id] — revierte un /cancelar (o responde)\n"
@@ -43,7 +43,7 @@ def kb_settings() -> InlineKeyboardMarkup:
     )
 
 def text_settings() -> str:
-    onoff = "ON" if is_active_backup() else "OFF"
+    onoff = "ON" if ACTIVE_BACKUP else "OFF"
     return (
         f"📡 **Targets**\n"
         f"• Principal: `{TARGET_CHAT_ID}` **ON** (fijo)\n"
