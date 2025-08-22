@@ -92,7 +92,7 @@ _STATS = {"cancelados": 0, "eliminados": 0}
 _SCHEDULED_LOCK: Set[int] = set()
 
 # ========= REGISTRO DE PROGRAMACIONES =========
-# Guardamos programaciones pendientes: {pid: {"when": datetime, "ids": [...], "rows": [(id,text,raw)], "job": Job}}
+# {pid: {"when": datetime, "ids": [...], "rows": [(id,text,raw)], "job": Job}}
 _SCHEDULES: Dict[int, Dict] = {}
 _SCHED_SEQ: int = 0
 
@@ -213,7 +213,7 @@ def _poll_payload_from_raw(raw: dict) -> Tuple[dict, bool]:
         except Exception:
             pass
 
-    if is_quiz y p.get("explanation"):
+    if is_quiz and p.get("explanation"):
         kwargs["explanation"] = str(p["explanation"])
 
     return kwargs, is_quiz
@@ -312,7 +312,7 @@ def _human_eta(target_dt: datetime, now: Optional[datetime] = None) -> str:
 
 
 # -------------------------------------------------------
-# Publicar borradores: seleccionados o todos (excluyendo bloqueados)
+# Publicar borradores
 # -------------------------------------------------------
 async def _publicar_rows(context: ContextTypes.DEFAULT_TYPE, *, rows: List[Tuple[int, str, str]], targets: List[int], mark_as_sent: bool) -> Tuple[int, int, Dict[int, List[int]]]:
     publicados = 0
@@ -359,8 +359,7 @@ async def _publicar_rows(context: ContextTypes.DEFAULT_TYPE, *, rows: List[Tuple
 
 
 async def _publicar(context: ContextTypes.DEFAULT_TYPE, *, targets: List[int], mark_as_sent: bool) -> Tuple[int, int, Dict[int, List[int]]]:
-    """Envía la cola completa EXCLUYENDO los bloqueados (_SCHEDULED_LOCK)."""
-    all_rows = get_unsent_drafts(DB_FILE)  # [(message_id, text, raw_json)]
+    all_rows = get_unsent_drafts(DB_FILE)
     if not all_rows:
         return 0, 0, {t: [] for t in targets}
     rows = [(m, t, r) for (m, t, r) in all_rows if m not in _SCHEDULED_LOCK]
@@ -369,12 +368,10 @@ async def _publicar(context: ContextTypes.DEFAULT_TYPE, *, targets: List[int], m
     return await _publicar_rows(context, rows=rows, targets=targets, mark_as_sent=mark_as_sent)
 
 
-async def _publicar_ids_snapshot(context: ContextTypes.DEFAULT_TYPE, *, ids: List[int], rows_snapshot: List[Tuple[int, str, str]], targets: List[int], mark_as_sent: bool) -> Tuple[int, int, Dict[int, List[int]]]:
-    """Publica usando el *snapshot* (rows_snapshot) tomado al programar, para evitar inconsistencias."""
+async def _publicar_ids_snapshot(context: ContextTypes.DEFAULT_TYPE, *, rows_snapshot: List[Tuple[int, str, str]], targets: List[int], mark_as_sent: bool) -> Tuple[int, int, Dict[int, List[int]]]:
     if not rows_snapshot:
         return 0, 0, {t: [] for t in targets}
-    pubs, fails, posted = await _publicar_rows(context, rows=rows_snapshot, targets=targets, mark_as_sent=mark_as_sent)
-    return pubs, fails, posted
+    return await _publicar_rows(context, rows=rows_snapshot, targets=targets, mark_as_sent=mark_as_sent)
 
 
 async def _publicar_todo_activos(context: ContextTypes.DEFAULT_TYPE) -> Tuple[int, int]:
@@ -413,7 +410,6 @@ async def _cmd_listar(context: ContextTypes.DEFAULT_TYPE):
             s = (snip or "").strip()
             if len(s) > 60:
                 s = s[:60] + "…"
-            # marca si está programado
             tag = ""
             for pid, rec in _SCHEDULES.items():
                 if did in rec.get("ids", []):
@@ -423,7 +419,6 @@ async def _cmd_listar(context: ContextTypes.DEFAULT_TYPE):
     else:
         lines.append("📁 No hay borradores.")
 
-    # sección de programaciones
     if _SCHEDULES:
         now = datetime.now(tz=TZ)
         lines.append("\n🗒 Programaciones pendientes:")
@@ -499,16 +494,13 @@ async def _schedule_ids(context: ContextTypes.DEFAULT_TYPE, when_dt: datetime, i
         await _temp_notice(context, "📭 No hay borradores para programar.", ttl=6)
         return
 
-    # snapshot de filas actuales
     rows_snapshot = _get_rows_by_ids(DB_FILE, ids)
     if not rows_snapshot:
         await _temp_notice(context, "📭 Nada programable (vacío).", ttl=5)
         return
 
-    # bloquear ids
     _SCHEDULED_LOCK.update(ids)
 
-    # registrar
     global _SCHED_SEQ
     _SCHED_SEQ += 1
     pid = _SCHED_SEQ
@@ -518,11 +510,9 @@ async def _schedule_ids(context: ContextTypes.DEFAULT_TYPE, when_dt: datetime, i
     async def job(ctx: ContextTypes.DEFAULT_TYPE):
         try:
             pubs, fails, _posted = await _publicar_ids_snapshot(
-                ctx, ids=ids, rows_snapshot=rows_snapshot,
-                targets=get_active_targets(), mark_as_sent=True
+                ctx, rows_snapshot=rows_snapshot, targets=get_active_targets(), mark_as_sent=True
             )
         finally:
-            # desbloquear y limpiar registro
             for i in ids:
                 _SCHEDULED_LOCK.discard(i)
             _SCHEDULES.pop(pid, None)
@@ -549,7 +539,6 @@ async def _schedule_ids(context: ContextTypes.DEFAULT_TYPE, when_dt: datetime, i
             "❌ No pude programar. Falta JobQueue. Asegúrate de usar `python-telegram-bot[job-queue]`.",
             parse_mode="Markdown",
         )
-        # revertir bloqueo si no hay job queue
         for i in ids:
             _SCHEDULED_LOCK.discard(i)
         _SCHEDULES.pop(pid, None)
@@ -574,7 +563,6 @@ async def _cmd_programar(context: ContextTypes.DEFAULT_TYPE, when_str: str):
         )
         return
 
-    # capturamos los IDs ACTUALES (pendientes y no eliminados)
     ids = [did for (did, _snip) in list_drafts(DB_FILE)]
     await _schedule_ids(context, when, ids)
 
@@ -682,8 +670,8 @@ async def _cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE, txt: str):
 # ---------- NUKE ----------
 def _parse_nuke_selection(arg: str, drafts: List[Tuple[int, str]]) -> Set[int]:
     arg = (arg or "").strip().lower()
-    # normalizar comas con/ sin espacios: "1,2, 3 , 4"
-    arg = ",".join([p.strip() for p in arg.split(",")])  # colapsa espacios
+    # normalizar comas con/ sin espacios
+    arg = ",".join([p.strip() for p in arg.split(",")])
     ids_in_order = [did for (did, _snip) in drafts]
     result: Set[int] = set()
 
@@ -840,7 +828,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     data = q.data or ""
     try:
-        # Menú principal
         if data == "m:list":
             await _cmd_listar(context)
         elif data == "m:send":
@@ -874,7 +861,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data == "m:back":
             await q.edit_message_text(_text_main(), reply_markup=_kb_main())
 
-        # Programación rápida
         elif data.startswith("s:"):
             now = datetime.now(tz=TZ)
             when = None
@@ -899,7 +885,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
             if when:
-                # IDs actuales
                 ids = [did for (did, _snip) in list_drafts(DB_FILE)]
                 if not ids:
                     await _temp_notice(context, "📭 No hay borradores para programar.", ttl=6)
