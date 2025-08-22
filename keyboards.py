@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from config import TARGET_CHAT_ID, BACKUP_CHAT_ID, PREVIEW_CHAT_ID
-from publisher import ACTIVE_BACKUP  # leemos el estado actual
+from publisher import is_active_backup  # lee el estado en tiempo real
 
 def kb_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -15,7 +15,7 @@ def kb_main() -> InlineKeyboardMarkup:
     )
 
 def text_main() -> str:
-    # ⚠️ Texto largo, NO resumido (como en tu panel original)
+    # Texto completo (no resumido), como en tu panel largo
     return (
         "🛠️ Comandos:\n"
         "• /listar — muestra borradores pendientes (excluye los programados)\n"
@@ -43,7 +43,7 @@ def kb_settings() -> InlineKeyboardMarkup:
     )
 
 def text_settings() -> str:
-    onoff = "ON" if ACTIVE_BACKUP else "OFF"
+    onoff = "ON" if is_active_backup() else "OFF"
     return (
         f"📡 **Targets**\n"
         f"• Principal: `{TARGET_CHAT_ID}` **ON** (fijo)\n"
@@ -51,25 +51,4 @@ def text_settings() -> str:
         f"• Preview  : `{PREVIEW_CHAT_ID}`\n\n"
         "Usa el botón para alternar backup.\n"
         "⬅️ *Volver* regresa al menú principal."
-    )
-
-def kb_schedule() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("⏳ +5 min", callback_data="s:+5"),
-             InlineKeyboardButton("⏳ +15 min", callback_data="s:+15")],
-            [InlineKeyboardButton("🕗 Hoy 20:00", callback_data="s:today20"),
-             InlineKeyboardButton("🌅 Mañana 07:00", callback_data="s:tom07")],
-            [InlineKeyboardButton("🗒 Ver programados", callback_data="s:list"),
-             InlineKeyboardButton("❌ Cancelar todos", callback_data="s:clear")],
-            [InlineKeyboardButton("✍️ Custom", callback_data="s:custom"),
-             InlineKeyboardButton("⬅️ Volver", callback_data="m:back")]
-        ]
-    )
-
-def text_schedule() -> str:
-    return (
-        "⏰ Programar envío de **los borradores actuales**.\n"
-        "Elige un atajo o usa `/programar YYYY-MM-DD HH:MM` (formato 24h: 00:00–23:59, sin '(24h)' ni AM/PM).\n"
-        "⚠️ Si no hay borradores, no se programa nada."
     )
