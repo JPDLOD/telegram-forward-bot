@@ -1,41 +1,87 @@
 # -*- coding: utf-8 -*-
-"""
-publisher.py
--------------
-Funciones de publicación y estado compartido para targets.
-"""
-
-from typing import List, Dict, Tuple, Set
 import json
 import logging
+from typing import List, Tuple, Dict
 
-from telegram.error import TelegramError, RetryAfter, TimedOut, NetworkError
+from telegram.error import RetryAfter, TimedOut, NetworkError, TelegramError
+from telegram.ext import ContextTypes
 
-from config import (
-    SOURCE_CHAT_ID,
-    TARGET_CHAT_ID,
-    BACKUP_CHAT_ID,
-    PAUSE,
-    DB_FILE,
-)
+from config import TARGET_CHAT_ID, BACKUP_CHAT_ID, PAUSE, SOURCE_CHAT_ID, DB_FILE
 from database import get_unsent_drafts, mark_sent
 
 logger = logging.getLogger(__name__)
 
-# ========= ESTADO COMPARTIDO =========
-ACTIVE_BACKUP: bool = True  # única fuente de la verdad
-STATS = {"cancelados": 0, "eliminados": 0}
-LAST_BATCH: Dict[int, List[int]] = {}        # {chat_id_destino: [message_ids publicados allá]}
-SCHEDULED_LOCK: Set[int] = set()             # ids bloqueados por programación
+# ===== Estado de backup (runtime) =====
+ACTIVE_BACKUP: bool = True
 
+def is_active_backup() -> bool:
+    """Devuelve el estado actual del backup (True/False)."""
+    return ACTIVE_BACKUP
 
-# ---------- helpers de encuestas ----------
-def _poll_payload_from_raw(raw: dict) -> Tuple[dict, bool]:
+def set_active_backup(value: bool) -> None:
+    """Actualiza el estado global del backup de forma segura."""
+    global ACTIVE_BACKUP
+    ACTIVE_BACKUP = bool(value)
+
+def get_active_targets() -> List[int]:
+    """Targets activos según el estado de backup."""
+    targets = [TARGET_CHAT_ID]
+    if is_active_backup() and BACKUP_CHAT_ID:
+        targets.append(BACKUP_CHAT_ID)
+    return targets
+
+# ===== Helpers internos de envío =====
+async def _safe_sleep(context, seconds: float):
+    # Este helper está aquí para mantener compatibilidad; el sleep real lo maneja el caller si lo necesita
+    pass
+
+async def _send_with_backoff(func_coro_factory, *, base_pause: float):
+    tries = 0
+    while True:
+        try:
+            msg = await func_coro_factory()
+            # La pausa la maneja el caller de publisher si lo requiere; aquí no dormimos
+            return True, msg
+        except RetryAfter as e:
+            wait = getattr(e, "retry_after", None)
+            if wait is None:
+                wait = 3
+            logging.warning(f"RetryAfter: {wait}s …")
+            import asyncio
+            await asyncio.sleep(wait + 1.0)
+            tries += 1
+        except TimedOut:
+            logging.warning("TimedOut: 3s …")
+            import asyncio
+            await asyncio.sleep(3.0)
+            tries += 1
+        except NetworkError:
+            logging.warning("NetworkError: 3s …")
+            import asyncio
+            await asyncio.sleep(3.0)
+            tries += 1
+        except TelegramError as e:
+            if "Flood control exceeded" in str(e):
+                import asyncio
+                await asyncio.sleep(5.0)
+                tries += 1
+            else:
+                logging.error(f"TelegramError no recuperable: {e}")
+                return False, None
+        except Exception as e:
+            logging.exception(f"Error enviando: {e}")
+            return False, None
+
+        if tries >= 5:
+            logging.error("Demasiados reintentos; abandono este mensaje.")
+            return False, None
+
+# ===== Publicadores =====
+async def _poll_payload_from_raw(raw: dict):
     p = raw.get("poll") or {}
     question = p.get("question", "Pregunta")
     options_src = p.get("options", []) or []
     options = [o.get("text", "") for o in options_src]
-
     is_anon = p.get("is_anonymous", True)
     allows_multiple = p.get("allows_multiple_answers", False)
     ptype = (p.get("type") or "regular").lower().strip()
@@ -46,10 +92,8 @@ def _poll_payload_from_raw(raw: dict) -> Tuple[dict, bool]:
         options=options,
         is_anonymous=is_anon,
     )
-
     if not is_quiz:
         kwargs["allows_multiple_answers"] = bool(allows_multiple)
-
     if is_quiz:
         kwargs["type"] = "quiz"
         cid = p.get("correct_option_id")
@@ -77,75 +121,8 @@ def _poll_payload_from_raw(raw: dict) -> Tuple[dict, bool]:
 
     return kwargs, is_quiz
 
-
-# ========= TARGETS =========
-def get_active_targets() -> List[int]:
-    targets = [TARGET_CHAT_ID]
-    if ACTIVE_BACKUP and BACKUP_CHAT_ID:
-        targets.append(BACKUP_CHAT_ID)
-    return targets
-
-def is_backup_on() -> bool:
-    return ACTIVE_BACKUP
-
-def set_active_backup(on: bool) -> bool:
-    global ACTIVE_BACKUP
-    ACTIVE_BACKUP = bool(on)
-    return ACTIVE_BACKUP
-
-def toggle_active_backup() -> bool:
-    global ACTIVE_BACKUP
-    ACTIVE_BACKUP = not ACTIVE_BACKUP
-    return ACTIVE_BACKUP
-
-
-# ========= utilidades internas =========
-async def _safe_sleep(seconds: float, asyncio_mod):
-    try:
-        await asyncio_mod.sleep(max(0.0, seconds))
-    except Exception:
-        pass
-
-
-async def _send_with_backoff(func_coro_factory, base_pause: float, asyncio_mod):
-    tries = 0
-    while True:
-        try:
-            msg = await func_coro_factory()
-            await _safe_sleep(base_pause, asyncio_mod)
-            return True, msg
-        except RetryAfter as e:
-            wait = getattr(e, "retry_after", None)
-            if wait is None:
-                import re
-                m = re.search(r"Retry in (\d+)", str(e))
-                wait = int(m.group(1)) if m else 3
-            await _safe_sleep(wait + 1.0, asyncio_mod)
-            tries += 1
-        except (TimedOut, NetworkError):
-            await _safe_sleep(3.0, asyncio_mod)
-            tries += 1
-        except TelegramError as e:
-            if "Flood control exceeded" in str(e):
-                import re
-                m = re.search(r"Retry in (\d+)", str(e))
-                wait = int(m.group(1)) if m else 5
-                await _safe_sleep(wait + 1.0, asyncio_mod)
-                tries += 1
-            else:
-                logger.error(f"TelegramError no recuperable: {e}")
-                return False, None
-        except Exception as e:
-            logger.exception(f"Error enviando: {e}")
-            return False, None
-
-        if tries >= 5:
-            logger.error("Demasiados reintentos; abandono este mensaje.")
-            return False, None
-
-
-# ========= publicación =========
-async def publicar_rows(context, rows: List[Tuple[int, str, str]], targets: List[int], mark_as_sent: bool, asyncio_mod) -> Tuple[int, int, Dict[int, List[int]]]:
+async def _publicar_rows(context: ContextTypes.DEFAULT_TYPE, *, rows: List[Tuple[int, str, str]],
+                         targets: List[int], mark_as_sent: bool) -> Tuple[int, int, Dict[int, List[int]]]:
     publicados = 0
     fallidos = 0
     enviados_ids: List[int] = []
@@ -160,16 +137,16 @@ async def publicar_rows(context, rows: List[Tuple[int, str, str]], targets: List
         any_success = False
         for dest in targets:
             if "poll" in data:
-                base_kwargs, _ = _poll_payload_from_raw(data)
+                base_kwargs, _ = await _poll_payload_from_raw(data)
                 kwargs = dict(base_kwargs)
                 kwargs["chat_id"] = dest
                 coro_factory = lambda k=kwargs: context.bot.send_poll(**k)
-                ok, msg = await _send_with_backoff(coro_factory, PAUSE, asyncio_mod)
+                ok, msg = await _send_with_backoff(coro_factory, base_pause=PAUSE)
             else:
                 coro_factory = lambda d=dest, m=mid: context.bot.copy_message(
                     chat_id=d, from_chat_id=SOURCE_CHAT_ID, message_id=m
                 )
-                ok, msg = await _send_with_backoff(coro_factory, PAUSE, asyncio_mod)
+                ok, msg = await _send_with_backoff(coro_factory, base_pause=PAUSE)
 
             if ok:
                 any_success = True
@@ -188,34 +165,23 @@ async def publicar_rows(context, rows: List[Tuple[int, str, str]], targets: List
 
     return publicados, fallidos, posted_by_target
 
-
-async def publicar(context, asyncio_mod):
-    """Publica todo lo pendiente EXCLUYENDO bloqueados por programación."""
-    all_rows = get_unsent_drafts(DB_FILE)
-    if not all_rows:
-        return 0, 0, {t: [] for t in get_active_targets()}
-    rows = [(m, t, r) for (m, t, r) in all_rows if m not in SCHEDULED_LOCK]
+async def publicar(context: ContextTypes.DEFAULT_TYPE, *, targets: List[int], mark_as_sent: bool):
+    """Publica todo lo pendiente (sin los bloqueados; eso lo maneja el caller)."""
+    rows = get_unsent_drafts(DB_FILE)
     if not rows:
-        return 0, 0, {t: [] for t in get_active_targets()}
-    return await publicar_rows(context, rows, get_active_targets(), True, asyncio_mod)
+        return 0, 0, {t: [] for t in targets}
+    return await _publicar_rows(context, rows=rows, targets=targets, mark_as_sent=mark_as_sent)
 
-
-async def publicar_ids(context, ids: List[int], asyncio_mod, mark_as_sent: bool = True):
+async def publicar_ids(context: ContextTypes.DEFAULT_TYPE, *, ids: List[int],
+                       targets: List[int], mark_as_sent: bool):
+    # En esta versión modular, main/scheduler ya filtran los rows específicos
+    from database import _conn  # usar acceso directo para query puntual sin duplicar lógica pública
+    c = _conn(DB_FILE)
     if not ids:
-        return 0, 0, {t: [] for t in get_active_targets()}
-    # filtramos desde DB para preservar orden y estado
-    from database import _conn  # uso interno para query simple
-    import sqlite3
-    try:
-        con = _conn(DB_FILE)
-        ph = ",".join("?" for _ in ids)
-        cur = con.execute(
-            f"SELECT message_id, snippet, raw_json FROM drafts "
-            f"WHERE sent=0 AND deleted=0 AND message_id IN ({ph}) "
-            f"ORDER BY created_at ASC",
-            ids
-        )
-        rows = list(cur.fetchall())
-    except sqlite3.Error:
-        rows = []
-    return await publicar_rows(context, rows, get_active_targets(), mark_as_sent, asyncio_mod)
+        return 0, 0, {t: [] for t in targets}
+    placeholders = ",".join("?" for _ in ids)
+    q = f"SELECT message_id, snippet, raw_json FROM drafts WHERE sent=0 AND deleted=0 AND message_id IN ({placeholders}) ORDER BY message_id ASC"
+    rows = list(c.execute(q, ids).fetchall())
+    if not rows:
+        return 0, 0, {t: [] for t in targets}
+    return await _publicar_rows(context, rows=rows, targets=targets, mark_as_sent=mark_as_sent)
