@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 import sqlite3
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
 _schema = """
 CREATE TABLE IF NOT EXISTS drafts (
@@ -12,6 +12,14 @@ CREATE TABLE IF NOT EXISTS drafts (
   created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
 CREATE INDEX IF NOT EXISTS idx_drafts_sent_deleted ON drafts(sent, deleted);
+
+-- Botones por mensaje (permite varios botones por draft)
+CREATE TABLE IF NOT EXISTS buttons (
+  message_id INTEGER NOT NULL,
+  label      TEXT NOT NULL,
+  url        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_buttons_message ON buttons(message_id);
 """
 
 _conn_cache = {}
@@ -90,3 +98,32 @@ def get_draft_snippet(path: str, message_id: int) -> Optional[str]:
     cur = c.execute("SELECT snippet FROM drafts WHERE message_id=?", (message_id,))
     row = cur.fetchone()
     return row[0] if row else None
+
+# =========================
+# BOTONES (para @@@)
+# =========================
+def add_button(path: str, message_id: int, label: str, url: str):
+    if not (message_id and label and url):
+        return
+    c = _conn(path)
+    c.execute(
+        "INSERT INTO buttons(message_id, label, url) VALUES (?,?,?)",
+        (int(message_id), str(label), str(url))
+    )
+    c.commit()
+
+def get_buttons_map_for_ids(path: str, ids: List[int]) -> Dict[int, List[Tuple[str, str]]]:
+    """Devuelve {message_id: [(label, url), ...]} solo para los ids dados."""
+    out: Dict[int, List[Tuple[str, str]]] = {i: [] for i in ids}
+    if not ids:
+        return out
+    c = _conn(path)
+    q = "SELECT message_id, label, url FROM buttons WHERE message_id IN (%s) ORDER BY rowid ASC" % ",".join("?"*len(ids))
+    for mid, label, url in c.execute(q, ids).fetchall():
+        out.setdefault(int(mid), []).append((label, url))
+    return out
+
+def clear_buttons(path: str, message_id: int):
+    c = _conn(path)
+    c.execute("DELETE FROM buttons WHERE message_id=?", (message_id,))
+    c.commit()
