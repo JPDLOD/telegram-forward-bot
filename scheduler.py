@@ -15,12 +15,15 @@ SCHEDULES: Dict[int, Dict] = {}
 SCHED_SEQ: int = 0
 
 async def schedule_ids(context: ContextTypes.DEFAULT_TYPE, when_dt: datetime, ids: List[int]):
+    """Programa el envío de esos IDs exactos. Bloquea esos IDs hasta que se ejecute."""
     if not ids:
         await context.bot.send_message(SOURCE_CHAT_ID, "📭 No hay borradores para programar.")
         return
 
+    # bloquear
     SCHEDULED_LOCK.update(ids)
 
+    # registrar
     global SCHED_SEQ
     SCHED_SEQ += 1
     pid = SCHED_SEQ
@@ -43,7 +46,8 @@ async def schedule_ids(context: ContextTypes.DEFAULT_TYPE, when_dt: datetime, id
             await ctx.bot.send_message(SOURCE_CHAT_ID, msg2)
             STATS["cancelados"] = 0
             STATS["eliminados"] = 0
-        except Exception:
+        except Exception as e:
+            logger.exception(f"Error en job programado: {e}")
             await ctx.bot.send_message(SOURCE_CHAT_ID, "❌ Error ejecutando la programación (revisa logs).")
         finally:
             for i in ids:
@@ -91,7 +95,6 @@ async def cmd_programar(context: ContextTypes.DEFAULT_TYPE, when_str: str):
     await schedule_ids(context, when, ids)
 
 async def cmd_programados(context: ContextTypes.DEFAULT_TYPE):
-    from config import TZNAME, TZ
     if not SCHEDULES:
         await context.bot.send_message(SOURCE_CHAT_ID, "📭 No hay programaciones pendientes.")
         return
